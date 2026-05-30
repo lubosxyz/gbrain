@@ -2,6 +2,103 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.35.0] - 2026-05-30
+
+**GBrain now has five built-in spots where an outside content checker can watch
+what flows in, and the open-source build ships with all five turned off.**
+
+If you run a brain, content arrives from places you don't fully control: a
+markdown note you imported, a code file you synced, a question typed at the LLM,
+a tool the agent decided to call. Any one of those can carry a prompt-injection
+payload or something you'd rather not store. Until now there was no clean place
+to hand that content to a checker (a content firewall, a PII scrubber, an
+injection detector) before GBrain acted on it.
+
+This release adds those clean places. Five hook points: the two file-import
+boundaries (markdown and code, right before the content gets chunked, embedded,
+and saved) and three LLM gateway boundaries (the user's chat message, the
+search-expansion query, and a tool call before it runs). A checker registered at
+any of these gets to see the content at the exact moment before GBrain commits
+to it.
+
+The whole thing is deliberately weak by design, and that's the point. The
+checker can only **watch**, never block. The interface returns nothing, so no
+GBrain code can branch on a checker's verdict. A checker that crashes, hangs, or
+times out can't break your import, your query, or your tool call — every hook
+fails open. And the open-source distribution registers zero checkers, so the
+seams are completely inert until you wire one in. No vendor code, no API URL, no
+phone-home anywhere in the public tree.
+
+This also closes a real gap. A prompt-injection payload that rides in through a
+file import used to have no checkpoint at all, because the only places anyone
+could hook were the LLM calls — and file content reaches retrieval without ever
+touching one. `file_storage.markdown` and `file_storage.code` are real hooks at
+that boundary now.
+
+How to use it (you write a provider in your own package, ~80 lines):
+
+```ts
+import { registerGuardrailProvider } from 'gbrain/core/guardrails';
+
+registerGuardrailProvider({
+  id: 'my-firewall',
+  async classify(input) {
+    // input.hook    — which boundary ('file_storage.markdown', 'ai_gateway.chat', ...)
+    // input.content — the raw text to inspect
+    // input.metadata — context (slug, source_kind, tool_name, model, ...)
+    // Return value is ignored by GBrain. Log a redacted verdict from here.
+    await fetch(MY_API, { method: 'POST', body: JSON.stringify({ text: input.content }) });
+  },
+});
+```
+
+Register it once at process init. Your provider owns its own timeout, secret
+handling, redacted logging, and (if you don't want to block on it) async
+fan-out. The full contract, the seam table, and the provider-authoring guide
+are in `docs/guardrails.md`.
+
+### Itemized changes
+
+#### Added
+
+- New module `src/core/guardrails.ts` — the vendor-neutral seam.
+  `runGuardrails({ hook, content, metadata })` returns `void` (observe-only by
+  construction). `registerGuardrailProvider` / `unregisterGuardrailProvider`
+  manage providers (idempotent by `id`). `hasGuardrails()` is a cheap hot-path
+  guard so hooks skip all work when no provider is registered. Providers are
+  snapshotted before iteration so a mid-flight register/unregister can't mutate
+  the running set, and every provider runs inside its own try/catch (one bad
+  provider can't stop a good one).
+- Two `file_storage.*` seams in `src/core/import-file.ts`:
+  `file_storage.markdown` fires in `importFromContent` after `parseMarkdown` +
+  the size guard and before content-sanity, hashing, chunking, embedding, and DB
+  write; `file_storage.code` fires in `importCodeFile` after the code size guard
+  and before hashing, code-chunking, embedding, and DB write. Both cover every
+  natural ingest caller that routes through these functions (`gbrain import`,
+  sync, capture, `put_page`, subagent `brain_put_page`, trusted-workspace
+  writes, `ingest_capture`, inbox dispatch, reindex, code reindex, the public
+  import APIs).
+- Three `ai_gateway.*` seams in `src/core/ai/gateway.ts`: `ai_gateway.chat`
+  classifies only the latest user message before provider inference;
+  `ai_gateway.expand` classifies the query before the expansion model call;
+  `ai_gateway.tool_input` classifies `{toolName, input}` before pending-persist
+  and before tool execution. Gateway hooks pass only the user/query/tool-input
+  payload — never system prompts, full chat history, tool output, LLM output,
+  embeddings, or multimodal/OCR/rerank payloads. A cycle-safe stringifier keeps
+  a weird tool payload from throwing inside the seam.
+- `docs/guardrails.md` — the contract (five hard invariants: observe-only, fail
+  open, inline await, no verdict persistence, content boundaries), the seam
+  table, the provider-authoring guide, and a shadow-mode provider sketch.
+
+### For contributors
+
+- `test/guardrails.test.ts` (14 tests) pins the contract: `runGuardrails`
+  resolves `void`, a throwing or rejecting provider is swallowed (fail-open
+  isolation), a slow async provider is awaited before resolving (inline),
+  zero providers is a no-op, empty/blank content short-circuits, registration
+  is idempotent by `id`, and content + metadata pass through unmutated. The
+  existing import-file tests still pass — the ingest hot path is undisturbed.
+
 ## [0.41.34.0] - 2026-05-30
 
 **Search now finds a page by its name, even when you only remember what you
