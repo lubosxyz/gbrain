@@ -31,6 +31,41 @@ fi
 
 echo "OK: no JSON.stringify(x)::jsonb interpolation pattern in src/"
 
+# Positional form: an executeRaw / executeRawDirect call that binds a
+# JSON.stringify(...) string param into a bare `$N::jsonb` cast. postgres.js
+# describes the parameter as jsonb (via the cast) and serializes the already-
+# stringified value AGAIN, producing a JSONB string scalar — silent corruption
+# everywhere, and a hard CHECK failure on op_checkpoints.completed_keys. The
+# interpolation check above does NOT catch this because the param is positional,
+# not template-interpolated. Fix: pass the JS value directly (objects only;
+# executeRawJsonb rejects top-level arrays) or cast `$N::text::jsonb` so Postgres
+# parses the JSON text into real jsonb. `executeRawJsonb(...)` is exempt — it
+# passes JS objects, not JSON.stringify, and the `executeRaw(` token below does
+# not match `executeRawJsonb(`.
+POSITIONAL_HITS=$(
+  find src -name '*.ts' -not -path '*/node_modules/*' -print0 2>/dev/null \
+  | xargs -0 perl -0777 -ne '
+      while (/\bexecuteRaw(?:Direct)?\s*\(/g) {
+        my $at = pos();
+        my $win = substr($_, $at, 1200);
+        $win =~ s/;.*//s;                       # bound to the statement
+        next unless $win =~ /\$[0-9]+::jsonb/;   # bare positional jsonb (not ::text::jsonb)
+        next unless $win =~ /JSON\.stringify\s*\(/;
+        my $line = 1 + (substr($_, 0, $at) =~ tr/\n//);
+        print "$ARGV:$line: executeRaw with bare \$N::jsonb + JSON.stringify (positional double-encode)\n";
+      }
+    ' 2>/dev/null
+)
+if [ -n "$POSITIONAL_HITS" ]; then
+  echo "$POSITIONAL_HITS"
+  echo
+  echo "ERROR: positional JSON.stringify(...) bound to a bare \$N::jsonb cast."
+  echo "       postgres.js re-stringifies it into a JSONB string scalar on Postgres."
+  echo "       Pass the JS value directly, or cast \$N::text::jsonb."
+  exit 1
+fi
+echo "OK: no positional JSON.stringify + \$N::jsonb double-encode pattern in src/"
+
 # v0.13.1 #219: guard against max_stalled DEFAULT 1 regressing in any schema
 # source file. DEFAULT 1 dead-lettered any SIGKILL'd job on first stall, making
 # the "10/10 rescued" claim false for out-of-the-box users. Default is 5 now.

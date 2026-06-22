@@ -232,7 +232,7 @@ export async function restoreSource(
      SET archived = false,
          archived_at = NULL,
          archive_expires_at = NULL,
-         config = COALESCE(config, '{}'::jsonb) || $1::jsonb
+         config = COALESCE(config, '{}'::jsonb) || $1::text::jsonb
      WHERE id = $2 AND archived = true
      RETURNING id`,
     [federatedPatch, sourceId],
