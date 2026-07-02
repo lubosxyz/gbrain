@@ -112,4 +112,27 @@ describe('v0.29 E2E — getRecentSalience (Garry test)', () => {
     const rows = await engine.getRecentSalience({ days: 7, slugPrefix: 'nope/does-not-exist/' });
     expect(rows).toEqual([]);
   });
+
+  test('last_retrieved_at (v0.42.x) is always present and null (no page in this fixture was ever read)', async () => {
+    const rows = await engine.getRecentSalience({ days: 30, slugPrefix: 'personal/wedding/' });
+    expect(rows.length).toBeGreaterThan(0);
+    for (const r of rows) {
+      expect(r).toHaveProperty('last_retrieved_at');
+      expect(r.last_retrieved_at).toBeNull();
+    }
+  });
+
+  test('last_retrieved_at reflects a bumpLastRetrievedAt write', async () => {
+    const { bumpLastRetrievedAt, awaitPendingLastRetrievedWrites } = await import('../../src/core/last-retrieved.ts');
+    const page = await engine.getPage('personal/wedding/photos-0');
+    expect(page).not.toBeNull();
+    bumpLastRetrievedAt(engine, [page!.id]);
+    await awaitPendingLastRetrievedWrites();
+
+    const rows = await engine.getRecentSalience({ days: 30, slugPrefix: 'personal/wedding/' });
+    const bumped = rows.find(r => r.slug === 'personal/wedding/photos-0');
+    expect(bumped).toBeDefined();
+    expect(bumped!.last_retrieved_at).not.toBeNull();
+    expect(bumped!.last_retrieved_at).toBeInstanceOf(Date);
+  });
 });

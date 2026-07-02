@@ -175,6 +175,20 @@ export interface Page {
    * for document-side cache invalidation per D27 P1-5. NULL on pre-v90 rows.
    */
   corpus_generation?: string | null;
+  /**
+   * v0.42.x — migration v79's `pages.last_retrieved_at` (see
+   * `src/core/last-retrieved.ts`). Bumped (5-min throttled, best-effort) by
+   * the `search` / `query` / `get_page` op handlers when a user-facing
+   * surface reads this page; internal callers (sync, migrations, dream
+   * cycle) never bump it. Three-state optional read like `deleted_at`:
+   * undefined when the SELECT projection omits the column, null when never
+   * retrieved (or pre-v79 brain), populated when a read has bumped it.
+   * NOTE: `get_page` returns the value as read BEFORE its own bump fires
+   * (fire-and-forget, issued after the row is already in hand), so a
+   * `get_page` call surfaces "last retrieved before THIS call", not a
+   * self-referential echo of the call that's reading it.
+   */
+  last_retrieved_at?: Date | null;
 }
 
 export type EffectiveDateSource =
@@ -441,6 +455,16 @@ export interface SalienceResult {
   take_count: number;
   take_avg_weight: number;
   score: number;
+  /**
+   * v0.42.x — the real per-page read signal (migration v79). Null when the
+   * page has never been surfaced by `search`/`query`/`get_page` (or on a
+   * pre-v79 brain, where the engine always returns null rather than
+   * omitting the field — `getRecentSalience` callers can rely on the key
+   * always being present). This is the field `tools/gbrain-recall-metric`
+   * probes for to auto-upgrade from `method=salience_proxy` to
+   * `method=access_count`.
+   */
+  last_retrieved_at: Date | null;
 }
 
 /**

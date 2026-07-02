@@ -29,6 +29,8 @@ describe('v0.29 — salience SQL shape pinned via type contract', () => {
     void sample.take_count;
     void sample.take_avg_weight;
     void sample.score;
+    // v0.42.x — the real read signal (migration v79); see last-retrieved.ts.
+    void sample.last_retrieved_at;
     expect(typeof mod).toBe('object');
   });
 });
