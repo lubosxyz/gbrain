@@ -87,6 +87,27 @@ describeBoth('v0.29 engine parity — getRecentSalience', () => {
     expect(pgliteWedding.size).toBe(postgresWedding.size);
     for (const s of pgliteWedding) expect(postgresWedding.has(s)).toBe(true);
   });
+
+  test('last_retrieved_at (v0.42.x) is null-by-default on both engines, then agrees after a bump', async () => {
+    const pgliteRows = await pglite.getRecentSalience({ days: 7, limit: 10 });
+    const postgresRows = await postgres.getRecentSalience({ days: 7, limit: 10 });
+    for (const r of pgliteRows) expect(r.last_retrieved_at).toBeNull();
+    for (const r of postgresRows) expect(r.last_retrieved_at).toBeNull();
+
+    const { bumpLastRetrievedAt, awaitPendingLastRetrievedWrites } = await import('../../src/core/last-retrieved.ts');
+    const pglitePage = await pglite.getPage('personal/wedding/photos-0');
+    const postgresPage = await postgres.getPage('personal/wedding/photos-0');
+    bumpLastRetrievedAt(pglite, [pglitePage!.id]);
+    bumpLastRetrievedAt(postgres, [postgresPage!.id]);
+    await awaitPendingLastRetrievedWrites();
+
+    const pgliteAfter = await pglite.getRecentSalience({ days: 7, limit: 10 });
+    const postgresAfter = await postgres.getRecentSalience({ days: 7, limit: 10 });
+    const pgliteBumped = pgliteAfter.find(r => r.slug === 'personal/wedding/photos-0');
+    const postgresBumped = postgresAfter.find(r => r.slug === 'personal/wedding/photos-0');
+    expect(pgliteBumped!.last_retrieved_at).not.toBeNull();
+    expect(postgresBumped!.last_retrieved_at).not.toBeNull();
+  });
 });
 
 describeBoth('v0.29 engine parity — findAnomalies', () => {

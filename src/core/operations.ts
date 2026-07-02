@@ -1379,6 +1379,11 @@ const list_pages: Operation = {
       title: pg.title,
       updated_at: pg.updated_at,
       ...(pg.deleted_at ? { deleted_at: pg.deleted_at } : {}),
+      // v0.42.x — expose the migration-v79 read signal (last_retrieved_at) on
+      // the machine (JSON) shape. Always present (null when never retrieved)
+      // rather than conditionally-omitted like deleted_at, so callers like
+      // tools/gbrain-recall-metric can probe for the key's presence.
+      last_retrieved_at: pg.last_retrieved_at ?? null,
     }));
   },
   scope: 'read',

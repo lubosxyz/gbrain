@@ -85,6 +85,8 @@ export function rowToPage(row: Record<string, unknown>): Page {
   const sourceUri = row.source_uri === undefined ? undefined : (row.source_uri as string | null);
   const ingestedVia = row.ingested_via === undefined ? undefined : (row.ingested_via as string | null);
   const ingestedAt = readOptionalDate(row.ingested_at);
+  // v0.42.x — migration v79 `last_retrieved_at` (see types.ts Page JSDoc).
+  const lastRetrievedAt = readOptionalDate(row.last_retrieved_at);
   return {
     id: row.id as number,
     slug: row.slug as string,
@@ -110,6 +112,7 @@ export function rowToPage(row: Record<string, unknown>): Page {
     ...(sourceUri !== undefined && { source_uri: sourceUri }),
     ...(ingestedVia !== undefined && { ingested_via: ingestedVia }),
     ...(ingestedAt !== undefined && { ingested_at: ingestedAt }),
+    ...(lastRetrievedAt !== undefined && { last_retrieved_at: lastRetrievedAt }),
     // v0.31.12: propagate source_id so downstream callers (embed, reconcile-links)
     // can thread it through getChunks / upsertChunks without defaulting to 'default'.
     // v0.32.8: Page.source_id is required. Every SELECT feeding rowToPage now

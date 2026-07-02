@@ -915,7 +915,7 @@ export class PostgresEngine implements BrainEngine {
     const deletedCondition = includeDeleted ? sql`` : sql`AND deleted_at IS NULL`;
     const rows = await sql`
       SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
-             source_kind, source_uri, ingested_via, ingested_at
+             source_kind, source_uri, ingested_via, ingested_at, last_retrieved_at
       FROM pages
       WHERE slug = ${slug} ${sourceCondition} ${deletedCondition}
       LIMIT 1
@@ -5507,7 +5507,7 @@ export class PostgresEngine implements BrainEngine {
       });
     }
     const rows = await sql`
-      SELECT p.slug, p.source_id, p.title, p.type, p.updated_at, p.emotional_weight,
+      SELECT p.slug, p.source_id, p.title, p.type, p.updated_at, p.emotional_weight, p.last_retrieved_at,
              COUNT(DISTINCT t.id) AS take_count,
              COALESCE(AVG(t.weight), 0) AS take_avg_weight,
              (p.emotional_weight * 5)
@@ -5532,6 +5532,9 @@ export class PostgresEngine implements BrainEngine {
       take_count: Number(r.take_count ?? 0),
       take_avg_weight: Number(r.take_avg_weight ?? 0),
       score: Number(r.score ?? 0),
+      // v0.42.x — the real read signal (migration v79). Null when the page
+      // has never been surfaced by search/query/get_page.
+      last_retrieved_at: r.last_retrieved_at == null ? null : new Date(r.last_retrieved_at as string),
     }));
   }
 
