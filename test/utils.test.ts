@@ -77,6 +77,38 @@ describe('rowToPage', () => {
     expect(page.created_at).toBeInstanceOf(Date);
     expect(page.updated_at).toBeInstanceOf(Date);
   });
+
+  describe('last_retrieved_at (v0.42.x, migration v79)', () => {
+    test('three-state: absent from the row projection -> undefined (key omitted)', () => {
+      const page = rowToPage({
+        id: 1, slug: 'test', type: 'concept', title: 'Test',
+        compiled_truth: '', timeline: '', frontmatter: '{}',
+        content_hash: null, created_at: '2024-01-01', updated_at: '2024-01-01',
+      });
+      expect('last_retrieved_at' in page).toBe(false);
+    });
+
+    test('three-state: NULL column value -> null (never retrieved)', () => {
+      const page = rowToPage({
+        id: 1, slug: 'test', type: 'concept', title: 'Test',
+        compiled_truth: '', timeline: '', frontmatter: '{}',
+        content_hash: null, created_at: '2024-01-01', updated_at: '2024-01-01',
+        last_retrieved_at: null,
+      });
+      expect(page.last_retrieved_at).toBeNull();
+    });
+
+    test('three-state: populated column value -> Date', () => {
+      const page = rowToPage({
+        id: 1, slug: 'test', type: 'concept', title: 'Test',
+        compiled_truth: '', timeline: '', frontmatter: '{}',
+        content_hash: null, created_at: '2024-01-01', updated_at: '2024-01-01',
+        last_retrieved_at: '2024-06-01T12:00:00Z',
+      });
+      expect(page.last_retrieved_at).toBeInstanceOf(Date);
+      expect((page.last_retrieved_at as Date).toISOString()).toBe('2024-06-01T12:00:00.000Z');
+    });
+  });
 });
 
 describe('rowToChunk', () => {

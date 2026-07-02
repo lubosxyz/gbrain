@@ -11,10 +11,27 @@ import type { PageInput, ChunkInput } from '../src/core/types.ts';
 
 let engine: PGLiteEngine;
 
+// Embedding dim the engine actually created `content_chunks.embedding` at.
+// Captured AFTER initSchema so tests use the same width the column was
+// created with — initSchema reads from `gw.getEmbeddingDimensions()` if
+// the gateway is configured (potentially leaked from another shard-6 test
+// file in the same bun process) and falls back to DEFAULT_EMBEDDING_DIMENSIONS
+// (currently 1280) otherwise. Hard-coding 1536 here would explode under any
+// gateway config, including the new ZE default.
+let CHUNK_EMBED_DIM = 0;
+
 beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({}); // in-memory
   await engine.initSchema();
+  // Probe the actual column width so test data matches whatever shard order
+  // happened to land us with.
+  const r = await (engine as any).db.query(
+    `SELECT atttypmod FROM pg_attribute
+       WHERE attrelid = 'content_chunks'::regclass AND attname = 'embedding'`
+  );
+  // pgvector stores dim in atttypmod directly (no -4 offset like varchar).
+  CHUNK_EMBED_DIM = (r.rows[0] as { atttypmod: number }).atttypmod;
 });
 
 afterAll(async () => {
@@ -211,7 +228,7 @@ describe('PGLiteEngine: Search', () => {
   });
 
   test('searchVector returns empty when no embeddings', async () => {
-    const fakeEmbedding = new Float32Array(1536);
+    const fakeEmbedding = new Float32Array(CHUNK_EMBED_DIM);
     const results = await engine.searchVector(fakeEmbedding);
     expect(results.length).toBe(0);
   });
@@ -382,13 +399,142 @@ describe('PGLiteEngine: Chunks', () => {
 
   test('getChunksWithEmbeddings returns embedding data', async () => {
     await engine.putPage('test/embed', testPage);
-    const embedding = new Float32Array(1536).fill(0.1);
+    const embedding = new Float32Array(CHUNK_EMBED_DIM).fill(0.1);
     await engine.upsertChunks('test/embed', [
       { chunk_index: 0, chunk_text: 'With embedding', chunk_source: 'compiled_truth', embedding },
     ]);
     const chunks = await engine.getChunksWithEmbeddings('test/embed');
     expect(chunks.length).toBe(1);
     expect(chunks[0].embedding).not.toBeNull();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// v0.33.4 D7 + IRON RULE — countStaleChunks + listStaleChunks contract
+// PGLite parity for the Postgres E2E in test/e2e/embed-stale-pagination.
+// Pins the tuple-compare `(cc.page_id, cc.chunk_index) > ($1, $2)` against
+// the WASM build (Postgres 17.5 in WASM has had quirks here historically).
+// ────────────────────────────────────────────────────────────────────────
+
+describe('PGLiteEngine: stale chunk pagination (D7 + REGRESSION)', () => {
+  beforeEach(truncateAll);
+
+  test('countStaleChunks: zero-state baseline', async () => {
+    expect(await engine.countStaleChunks()).toBe(0);
+  });
+
+  test('countStaleChunks counts chunks with NULL embedding only', async () => {
+    await engine.putPage('test/stale-a', testPage);
+    await engine.upsertChunks('test/stale-a', [
+      { chunk_index: 0, chunk_text: 'no embed', chunk_source: 'compiled_truth' },
+      { chunk_index: 1, chunk_text: 'has embed', chunk_source: 'compiled_truth', embedding: new Float32Array(CHUNK_EMBED_DIM).fill(0.1) },
+    ]);
+    expect(await engine.countStaleChunks()).toBe(1);
+  });
+
+  test('listStaleChunks: cursor pagination across page boundaries', async () => {
+    // Seed 3 pages × 3 chunks = 9 stale rows; walk with batchSize=2.
+    for (const slug of ['c-a', 'c-b', 'c-c']) {
+      await engine.putPage(`test/${slug}`, testPage);
+      await engine.upsertChunks(`test/${slug}`, [
+        { chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth' },
+        { chunk_index: 1, chunk_text: 'b', chunk_source: 'compiled_truth' },
+        { chunk_index: 2, chunk_text: 'c', chunk_source: 'compiled_truth' },
+      ]);
+    }
+    const visited = new Set<string>();
+    let after_pid = 0;
+    let after_idx = -1;
+    let lastPid = -1;
+    let lastIdx = -1;
+    let cursorMonotonic = true;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const batch = await engine.listStaleChunks({
+        batchSize: 2,
+        afterPageId: after_pid,
+        afterChunkIndex: after_idx,
+      });
+      if (batch.length === 0) break;
+      for (const row of batch) {
+        const key = `${row.page_id}::${row.chunk_index}`;
+        expect(visited.has(key)).toBe(false);
+        visited.add(key);
+        const advance = row.page_id > lastPid
+          || (row.page_id === lastPid && row.chunk_index > lastIdx);
+        if (!advance) cursorMonotonic = false;
+        lastPid = row.page_id;
+        lastIdx = row.chunk_index;
+      }
+      const tail = batch[batch.length - 1];
+      after_pid = tail.page_id;
+      after_idx = tail.chunk_index;
+      if (batch.length < 2) break;
+    }
+    expect(visited.size).toBe(9);
+    expect(cursorMonotonic).toBe(true);
+  });
+
+  test('listStaleChunks: page split across batches (1 page, 5 chunks, batchSize=2)', async () => {
+    await engine.putPage('test/split', testPage);
+    await engine.upsertChunks('test/split', [
+      { chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth' },
+      { chunk_index: 1, chunk_text: 'b', chunk_source: 'compiled_truth' },
+      { chunk_index: 2, chunk_text: 'c', chunk_source: 'compiled_truth' },
+      { chunk_index: 3, chunk_text: 'd', chunk_source: 'compiled_truth' },
+      { chunk_index: 4, chunk_text: 'e', chunk_source: 'compiled_truth' },
+    ]);
+    const collected: number[] = [];
+    let after_pid = 0;
+    let after_idx = -1;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const batch = await engine.listStaleChunks({
+        batchSize: 2,
+        afterPageId: after_pid,
+        afterChunkIndex: after_idx,
+      });
+      if (batch.length === 0) break;
+      for (const r of batch) collected.push(r.chunk_index);
+      const tail = batch[batch.length - 1];
+      after_pid = tail.page_id;
+      after_idx = tail.chunk_index;
+      if (batch.length < 2) break;
+    }
+    expect(collected).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  test('countStaleChunks + listStaleChunks honor sourceId filter (D7)', async () => {
+    // PGLite default seed has 'default' source. Add 'other-source' and
+    // seed identical slugs in both.
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path) VALUES ('other', 'other', '/tmp/other') ON CONFLICT (id) DO NOTHING`,
+    );
+    // Default source page via the engine API.
+    await engine.putPage('test/shared', testPage, { sourceId: 'default' });
+    await engine.upsertChunks('test/shared', [
+      { chunk_index: 0, chunk_text: 'default-0', chunk_source: 'compiled_truth' },
+      { chunk_index: 1, chunk_text: 'default-1', chunk_source: 'compiled_truth' },
+    ], { sourceId: 'default' });
+    // Same slug, different source.
+    await engine.putPage('test/shared', testPage, { sourceId: 'other' });
+    await engine.upsertChunks('test/shared', [
+      { chunk_index: 0, chunk_text: 'other-0', chunk_source: 'compiled_truth' },
+      { chunk_index: 1, chunk_text: 'other-1', chunk_source: 'compiled_truth' },
+      { chunk_index: 2, chunk_text: 'other-2', chunk_source: 'compiled_truth' },
+    ], { sourceId: 'other' });
+
+    expect(await engine.countStaleChunks()).toBe(5);
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(2);
+    expect(await engine.countStaleChunks({ sourceId: 'other' })).toBe(3);
+
+    const defaultRows = await engine.listStaleChunks({ sourceId: 'default', batchSize: 100 });
+    expect(defaultRows).toHaveLength(2);
+    for (const r of defaultRows) expect(r.source_id).toBe('default');
+
+    const otherRows = await engine.listStaleChunks({ sourceId: 'other', batchSize: 100 });
+    expect(otherRows).toHaveLength(3);
+    for (const r of otherRows) expect(r.source_id).toBe('other');
   });
 });
 
@@ -1165,7 +1311,10 @@ describe('PGLiteEngine: v0.13.1 error-wrap on connect() (#223)', () => {
     // issue and suggest gbrain doctor. Must NOT suggest "missing migrations"
     // as a cause (that was conflating #218 and #223 — migrations run AFTER
     // create()).
-    expect(src).toContain('this._db = await PGlite.create');
+    // #2084 wrapped the create call in preservingProcessExitCode (Emscripten
+    // exitCode containment); the try/catch + error wrap around it is unchanged.
+    expect(src).toContain('this._db = await preservingProcessExitCode(() =>');
+    expect(src).toContain('PGlite.create({');
     expect(src).toContain('https://github.com/garrytan/gbrain/issues/223');
     expect(src).toContain('gbrain doctor');
     expect(src).toContain('Original error:');

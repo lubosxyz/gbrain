@@ -8,7 +8,7 @@
  */
 
 import { createEngine } from '../core/engine-factory.ts';
-import { loadConfig, saveConfig, toEngineConfig, gbrainPath, type GBrainConfig } from '../core/config.ts';
+import { loadConfig, saveConfig, toEngineConfig, gbrainPath, effectiveEnvDatabaseUrl, type GBrainConfig } from '../core/config.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import type { EngineConfig } from '../core/types.ts';
 import { writeFileSync, readFileSync, existsSync, unlinkSync } from 'fs';
@@ -91,7 +91,8 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
   // Build target config
   const targetConfig: EngineConfig = { engine: opts.targetEngine };
   if (opts.targetEngine === 'postgres') {
-    targetConfig.database_url = opts.targetUrl || process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL;
+    // #427 guard: don't let a cwd-.env DATABASE_URL become a migration target.
+    targetConfig.database_url = opts.targetUrl || effectiveEnvDatabaseUrl();
     if (!targetConfig.database_url) {
       console.error('Target is Supabase but no connection string provided. Use: --url <connection_string>');
       process.exit(1);
@@ -244,19 +245,33 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
   }
   progress.finish();
 
-  // Copy config (selective)
+  // Copy config (selective).
+  //
+  // v0.37 fix wave Lane C.4: these DB-plane writes are SCHEMA METADATA for
+  // the target engine — they record "the schema was sized using this
+  // embedding model + dimension." They are NOT the runtime gateway config
+  // (which lives in the file plane via `~/.gbrain/config.json`). When this
+  // function copies them, it's preserving the schema-applied state across
+  // the migration, not re-pointing the gateway. The newConfig below
+  // doesn't carry these fields because the user's existing file config
+  // already has them (or didn't, in which case the file plane should stay
+  // unset and re-read from gateway defaults).
   const configKeys = ['embedding_model', 'embedding_dimensions', 'chunk_strategy'];
   for (const key of configKeys) {
     const val = await sourceEngine.getConfig(key);
     if (val) await targetEngine.setConfig(key, val);
   }
 
-  // Update local config
+  // Update local config. v0.37 fix wave: preserve existing file-plane
+  // embedding/expansion/chat config across the engine migration; only
+  // the engine + connection target should change.
+  const existingFile = (await import('../core/config.ts')).loadConfigFileOnly() ?? ({} as GBrainConfig);
   const newConfig: GBrainConfig = {
+    ...existingFile,
     engine: opts.targetEngine,
     ...(opts.targetEngine === 'postgres'
-      ? { database_url: targetConfig.database_url }
-      : { database_path: targetConfig.database_path }),
+      ? { database_url: targetConfig.database_url, database_path: undefined }
+      : { database_path: targetConfig.database_path, database_url: undefined }),
   };
   saveConfig(newConfig);
 
