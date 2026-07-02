@@ -1,0 +1,31 @@
+# Minimal CI: install + typecheck on every push + PR.
+#
+# This is the lightweight, dependency-free gate (no Postgres service, no API
+# keys) that runs everywhere and fast. The fuller suites already live alongside
+# it: `test.yml` (sharded `bun test` + `bun run verify`) and `e2e.yml`
+# (Postgres-backed E2E). This workflow just guarantees the project installs and
+# typechecks cleanly, which is the cheapest signal and catches the most common
+# breakage.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run typecheck
