@@ -2,6 +2,24 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.53.0] - 2026-07-02
+
+**A class of writes to a Postgres-backed brain could get silently mangled or, in the worst case, block sync outright — both are now fixed, and gbrain also tells you honestly when a page was last actually read, not just how relevant it looked.**
+
+Some database writes pack a JSON value into a parameter and hand Postgres a cast telling it "this is JSON." When Postgres's driver already knows that from the cast, telling it a second time (by pre-encoding the value yourself) makes it encode twice, turning a JSON object into a JSON string that just contains more JSON text. Most of the time this quietly stored the wrong shape of data. In one specific place (the internal bookkeeping table sync uses to track progress) it triggered a hard database check, and any sync with real work to do would refuse to run at all. This only ever showed up against a real Postgres database, never against the embedded local database, which is why it stayed hidden. Every affected write path is now fixed and a permanent CI check keeps this exact mistake from coming back, including a positional form the previous guard couldn't see.
+
+Separately, `salience get`, `salience list`, and `get_page` now report the true last-read timestamp for a page alongside the usual relevance score. This has been tracked internally for a while; it just wasn't visible on those surfaces before.
+
+### Fixed
+- **Postgres writes that pack a JSON value into a positional `$N::jsonb` parameter no longer double-encode it.** Every affected call site now sends the value as text and lets Postgres parse it (`$N::text::jsonb`), across sync bookkeeping, source config, subagent messages, the search query cache, the code-intelligence cache, calibration scorecards, and a handful of smaller internal tables. `gbrain sync` no longer aborts with a database check failure on a brain with real pending work.
+- **The write-pattern guard now catches the positional form of this mistake, not just the interpolated form.** A new Postgres regression test locks in the fix for the sync-bookkeeping write specifically, since that was the one that could actually block you.
+
+### Added
+- **`gbrain salience get/list` and `gbrain get` now include `last_retrieved_at`.** You get an honest "last actually read" timestamp next to the relevance score, on both the embedded and Postgres engines.
+
+### To take advantage of v0.42.53.0
+`gbrain upgrade`. Nothing to configure: the write-path fix and the new timestamp field are both on by default. If you'd previously seen `gbrain sync` abort with a database constraint error on `op_checkpoints`, it should now complete normally on the next run.
+
 ## [0.42.52.0] - 2026-06-18
 
 **Autopilot stops manufacturing dead jobs and wedging its own queue, plus four operational rough edges get fixed: minion attempt-accounting, `agent run` flag parsing, honest `sources status`, and a budgeted `gbrain status`.** On a multi-source Postgres brain, autopilot could fan out a continuous stream of dead `autopilot-cycle` jobs while the supervisor periodically wedged the very queue it exists to keep alive. The root cause was one disease with several interacting parts; this wave addresses all of them, then cleans up four smaller reliability bugs found alongside.
