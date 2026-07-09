@@ -15,7 +15,7 @@
 import { VERSION } from '../version.ts';
 import { loadConfig } from '../core/config.ts';
 import { loadCompletedMigrations, appendCompletedMigration, preferencesPaths, type CompletedMigrationEntry } from '../core/preferences.ts';
-import { migrations, compareVersions, type Migration, type OrchestratorOpts } from './migrations/index.ts';
+import { migrations, compareVersions, type Migration, type OrchestratorOpts, type OrchestratorResult } from './migrations/index.ts';
 
 /** Bug 3 — max consecutive partials before we wedge a migration. */
 const MAX_CONSECUTIVE_PARTIALS = 3;
@@ -270,6 +270,18 @@ function orchestratorOptsFrom(cli: ApplyMigrationsArgs): OrchestratorOpts {
 }
 
 /**
+ * Render the failed phases of an orchestrator result as printable lines.
+ * The v0.13.0 wedge (KOM-250) shipped a bare "reported status=failed" while
+ * the real reason (`column "event_page_id" does not exist`) sat unprinted in
+ * the ledger's phases[].detail for three runs — surface it with the failure.
+ */
+function failedPhaseLines(phases: OrchestratorResult['phases']): string[] {
+  return phases
+    .filter(p => p.status === 'failed')
+    .map(p => `  phase '${p.name}' failed${p.detail ? `: ${p.detail}` : ' (no detail recorded)'}`);
+}
+
+/**
  * Entry point. Does not call connectEngine — each phase inside an
  * orchestrator manages its own engine / subprocess lifecycle.
  */
@@ -442,6 +454,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
       const result = await m.orchestrator(orchestratorOptsFrom(cli));
       if (result.status === 'failed') {
         console.error(`Migration v${m.version} reported status=failed.`);
+        for (const line of failedPhaseLines(result.phases)) console.error(line);
         // Record the attempt as 'partial' (not 'complete') so the cap counts
         // it. Don't let a failed orchestrator look like it never ran.
         try {
@@ -483,6 +496,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
 
       if (result.status === 'partial') {
         console.log(`Migration v${m.version} finished as PARTIAL. Re-run \`gbrain apply-migrations --yes\` after resolving any pending host-work items.`);
+        for (const line of failedPhaseLines(result.phases)) console.error(line);
       } else {
         console.log(`Migration v${m.version} complete.`);
       }
@@ -507,4 +521,5 @@ export const __testing = {
   buildPlan,
   indexCompleted,
   statusForVersion,
+  failedPhaseLines,
 };

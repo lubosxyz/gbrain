@@ -10,7 +10,7 @@ import { describe, test, expect } from 'bun:test';
 import { __testing } from '../src/commands/apply-migrations.ts';
 import type { CompletedMigrationEntry } from '../src/core/preferences.ts';
 
-const { parseArgs, indexCompleted, buildPlan, statusForVersion } = __testing;
+const { parseArgs, indexCompleted, buildPlan, statusForVersion, failedPhaseLines } = __testing;
 
 describe('parseArgs', () => {
   test('default flags', () => {
@@ -164,6 +164,31 @@ describe('buildPlan — diff against completed + installed VERSION', () => {
     expect(plan.pending).toEqual([]);
     expect(plan.partial).toEqual([]);
     expect(plan.skippedFuture).toEqual([]);
+  });
+});
+
+// KOM-250 follow-up: a failed/partial orchestrator must print WHY (the
+// phases[].detail that lands in the ledger), not just "reported
+// status=failed" — the v0.13.0 wedge hid `column "event_page_id" does not
+// exist` from the operator for three runs.
+describe('failedPhaseLines', () => {
+  test('renders only failed phases, with their detail', () => {
+    const lines = failedPhaseLines([
+      { name: 'schema', status: 'failed', detail: 'column "event_page_id" does not exist' },
+      { name: 'frontmatter_backfill', status: 'complete' },
+      { name: 'verify', status: 'skipped' },
+    ]);
+    expect(lines).toEqual([`  phase 'schema' failed: column "event_page_id" does not exist`]);
+  });
+
+  test('failed phase without detail says so explicitly', () => {
+    const lines = failedPhaseLines([{ name: 'verify', status: 'failed' }]);
+    expect(lines).toEqual([`  phase 'verify' failed (no detail recorded)`]);
+  });
+
+  test('no failed phases → no lines', () => {
+    expect(failedPhaseLines([{ name: 'schema', status: 'complete' }])).toEqual([]);
+    expect(failedPhaseLines([])).toEqual([]);
   });
 });
 
