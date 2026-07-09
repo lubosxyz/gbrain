@@ -168,6 +168,14 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // SCHEMA_SQL replay creates the index. Powers `gbrain extract --stale` + the
   // `links_extraction_lag` doctor check.
   { kind: 'column', table: 'pages', column: 'links_extracted_at' },
+  // v0.42.x (v121) — forward-referenced by the partial indexes
+  // `idx_timeline_event_page` + `idx_timeline_event_dedup ON
+  // timeline_entries(event_page_id[, date]) WHERE event_page_id IS NOT NULL`.
+  // Pre-v121 brains have timeline_entries without this column (CREATE TABLE
+  // IF NOT EXISTS is a no-op on the existing table, so the A2 static check's
+  // "declared in CREATE TABLE body" coverage does NOT protect old brains).
+  // Wedged the v0.13.0 orchestrator migration on a v119 brain (KOM-250).
+  { kind: 'column', table: 'timeline_entries', column: 'event_page_id' },
 ];
 
 test('applyForwardReferenceBootstrap covers every forward reference declared in REQUIRED_BOOTSTRAP_COVERAGE', async () => {
@@ -253,6 +261,12 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
       ALTER TABLE pages DROP COLUMN IF EXISTS generation;
       ALTER TABLE pages DROP COLUMN IF EXISTS contextual_retrieval_mode;
       ALTER TABLE pages DROP COLUMN IF EXISTS corpus_generation;
+
+      -- v121 (KOM-250): pre-v121 brains lack timeline_entries.event_page_id.
+      DROP INDEX IF EXISTS idx_timeline_event_page;
+      DROP INDEX IF EXISTS idx_timeline_event_dedup;
+      ALTER TABLE timeline_entries DROP CONSTRAINT IF EXISTS timeline_entries_event_page_id_fkey;
+      ALTER TABLE timeline_entries DROP COLUMN IF EXISTS event_page_id;
     `);
 
     // Note: we don't strip sources.archived* here because they're inline in the
@@ -325,6 +339,14 @@ test('after bootstrap, PGLITE_SCHEMA_SQL replays without crashing on missing for
       ALTER TABLE pages DROP COLUMN IF EXISTS import_filename;
       ALTER TABLE pages DROP COLUMN IF EXISTS salience_touched_at;
       ALTER TABLE pages DROP COLUMN IF EXISTS emotional_weight;
+
+      -- v121 (KOM-250): schema-blob replay must survive a pre-v121
+      -- timeline_entries (its CREATE INDEX references event_page_id, and
+      -- CREATE TABLE IF NOT EXISTS won't re-add the column).
+      DROP INDEX IF EXISTS idx_timeline_event_page;
+      DROP INDEX IF EXISTS idx_timeline_event_dedup;
+      ALTER TABLE timeline_entries DROP CONSTRAINT IF EXISTS timeline_entries_event_page_id_fkey;
+      ALTER TABLE timeline_entries DROP COLUMN IF EXISTS event_page_id;
     `);
 
     // Bootstrap, then schema replay. Either step crashing fails the test.

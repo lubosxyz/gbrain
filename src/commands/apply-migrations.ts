@@ -14,7 +14,7 @@
 
 import { VERSION } from '../version.ts';
 import { loadConfig } from '../core/config.ts';
-import { loadCompletedMigrations, appendCompletedMigration, type CompletedMigrationEntry } from '../core/preferences.ts';
+import { loadCompletedMigrations, appendCompletedMigration, preferencesPaths, type CompletedMigrationEntry } from '../core/preferences.ts';
 import { migrations, compareVersions, type Migration, type OrchestratorOpts } from './migrations/index.ts';
 
 /** Bug 3 — max consecutive partials before we wedge a migration. */
@@ -399,9 +399,13 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   // Bug 3 — surface wedged migrations as a loud, actionable error.
   if (plan.wedged.length > 0) {
     for (const m of plan.wedged) {
+      // Point at the REAL ledger (GBRAIN_HOME-aware): the 'partial' entries'
+      // phases[].detail fields carry the per-phase failure reasons. The old
+      // hint referenced ~/.gbrain/upgrade-errors.jsonl, which nothing writes.
       console.error(
         `\nMigration v${m.version} is WEDGED (${MAX_CONSECUTIVE_PARTIALS}+ consecutive partials with no completion). ` +
-        `Check ~/.gbrain/upgrade-errors.jsonl for the last failure reasons, fix the underlying issue, then run:\n` +
+        `Check the 'partial' entries for ${m.version} in ${preferencesPaths.completedJsonl()} ` +
+        `(phases[].detail has the failure reasons), fix the underlying issue, then run:\n` +
         `  gbrain apply-migrations --force-retry ${m.version}\n` +
         `Then re-run \`gbrain apply-migrations --yes\`.`,
       );

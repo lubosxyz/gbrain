@@ -84,6 +84,45 @@ describe.skipIf(skip)('PostgresEngine forward-reference bootstrap (E2E)', () => 
     expect(srcCheck).toHaveLength(1);
   });
 
+  test('PostgresEngine.initSchema survives pre-v121 timeline_entries missing event_page_id (KOM-250)', async () => {
+    // v121 forward-reference incident: SCHEMA_SQL's partial indexes
+    // idx_timeline_event_page + idx_timeline_event_dedup reference
+    // timeline_entries.event_page_id, which pre-v121 brains lack (CREATE
+    // TABLE IF NOT EXISTS is a no-op on the existing table). Without the
+    // bootstrap case, initSchema crashes with `column "event_page_id" does
+    // not exist` before migration v121 can run — wedging every orchestrator
+    // migration whose phase A runs initSchema (KOM-250, personal brain).
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+
+    await conn.unsafe(`
+      DROP INDEX IF EXISTS idx_timeline_event_page;
+      DROP INDEX IF EXISTS idx_timeline_event_dedup;
+      ALTER TABLE timeline_entries DROP CONSTRAINT IF EXISTS timeline_entries_event_page_id_fkey;
+      ALTER TABLE timeline_entries DROP COLUMN IF EXISTS event_page_id;
+    `);
+    await engine.setConfig('version', '120');
+
+    await engine.initSchema();
+
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+
+    const colCheck = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'timeline_entries'
+        AND column_name = 'event_page_id'
+    `;
+    expect(colCheck).toHaveLength(1);
+
+    const idxCheck = await conn`
+      SELECT indexname FROM pg_indexes
+      WHERE tablename = 'timeline_entries'
+        AND indexname IN ('idx_timeline_event_page', 'idx_timeline_event_dedup')
+    `;
+    expect(idxCheck).toHaveLength(2);
+  });
+
   test('PostgresEngine.initSchema is idempotent on a brain already at LATEST', async () => {
     // Fresh-LATEST brain. Calling initSchema again must not error and must
     // not regress the version.

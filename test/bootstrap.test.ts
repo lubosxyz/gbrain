@@ -196,4 +196,49 @@ describe('PGLiteEngine#applyForwardReferenceBootstrap', () => {
       await engine.disconnect();
     }
   }, 30000);
+
+  test('pre-v121 timeline shape: initSchema survives missing event_page_id (KOM-250)', async () => {
+    // Pre-v121 brains have timeline_entries without event_page_id. The schema
+    // blob's `CREATE INDEX idx_timeline_event_page / idx_timeline_event_dedup
+    // ... WHERE event_page_id IS NOT NULL` crashed before migration v121
+    // could add the column — wedging every orchestrator migration whose
+    // phase A runs initSchema (observed as the v0.13.0 wedge on a v119
+    // personal brain, KOM-250). Exercise the full incident path:
+    // bootstrap → schema blob replay → runMigrations.
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const db = (engine as any).db;
+
+      await db.exec(`
+        DROP INDEX IF EXISTS idx_timeline_event_page;
+        DROP INDEX IF EXISTS idx_timeline_event_dedup;
+        ALTER TABLE timeline_entries DROP CONSTRAINT IF EXISTS timeline_entries_event_page_id_fkey;
+        ALTER TABLE timeline_entries DROP COLUMN IF EXISTS event_page_id;
+      `);
+      await engine.setConfig('version', '120');
+
+      // Without the bootstrap case this crashes on the blob's CREATE INDEX
+      // with `column "event_page_id" does not exist`.
+      await engine.initSchema();
+
+      expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+
+      const { rows: col } = await db.query(`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'timeline_entries' AND column_name = 'event_page_id'
+      `);
+      expect(col).toHaveLength(1);
+
+      const { rows: idx } = await db.query(`
+        SELECT indexname FROM pg_indexes
+        WHERE tablename = 'timeline_entries'
+          AND indexname IN ('idx_timeline_event_page', 'idx_timeline_event_dedup')
+      `);
+      expect(idx).toHaveLength(2);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
 });
