@@ -19,6 +19,7 @@ import type {
   DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow,
 } from './types.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
+import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
 import { deriveResolutionTuple, finalizeScorecard } from './takes-resolution.ts';
 import { normalizeWeightForStorage } from './takes-fence.ts';
 import { executeRawJsonb } from './sql-query.ts';
@@ -2516,8 +2517,15 @@ export class PostgresEngine implements BrainEngine {
     // updated_at; sites that omit it fall back to defaultExtractedAt.
     const tss = refs.map(r => r.extractedAt ?? defaultExtractedAt);
     const sql = this.sql;
+    // GREATEST-clamp to LINK_EXTRACTOR_VERSION_TS: a page whose read updated_at
+    // predates the version stamp must not persist a watermark older than the
+    // version, or buildStalePagesWhere's version arm (links_extracted_at <
+    // versionTs) re-trips on every future sweep — a page untouched since before
+    // the bump never clears. Clamping only ever raises the stamp, so the D4
+    // race fix (a concurrent edit's updated_at, always >= now() >> versionTs in
+    // practice, exceeding the clamped stamp) still re-flags it as stale.
     await sql`
-      UPDATE pages p SET links_extracted_at = v.ts::timestamptz
+      UPDATE pages p SET links_extracted_at = GREATEST(v.ts::timestamptz, ${LINK_EXTRACTOR_VERSION_TS}::timestamptz)
       FROM unnest(${slugs}::text[], ${srcs}::text[], ${tss}::text[]) AS v(slug, source_id, ts)
       WHERE p.slug = v.slug AND p.source_id = v.source_id
     `;

@@ -11,6 +11,12 @@
  *     nothing, --source-id scope.
  *   - CRITICAL regression (CDX-1): a page edited after a prior stamp
  *     (updated_at > links_extracted_at) is re-flagged stale and re-extracted.
+ *   - CRITICAL regression (versionTs floor, KOM fork reconcile 2026-07-09):
+ *     markPagesExtractedBatch clamps the persisted stamp to
+ *     GREATEST(extractedAt, LINK_EXTRACTOR_VERSION_TS) — a page untouched
+ *     since before the version bump clears after ONE sweep and stays clear,
+ *     instead of re-tripping the version arm forever. The clamp only raises
+ *     the stamp, so a concurrent edit during the sweep is still not masked.
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
@@ -63,14 +69,30 @@ describe('engine: stale-page extraction methods', () => {
 
   test('countStalePagesForExtraction: version arm flags pre-version stamps', async () => {
     await engine.putPage('people/alice', personPage('Alice'));
-    // Stamp with an OLD timestamp (before LINK_EXTRACTOR_VERSION_TS).
-    await engine.markPagesExtractedBatch([{ slug: 'people/alice', source_id: 'default' }], '2000-01-01T00:00:00Z');
-    // Without versionTs: only NULL/edited arms → not stale (stamp >= updated? no:
-    // stamp is 2000, updated is now → updated_at > stamp → STALE via edited arm).
-    // So set updated_at back too, isolating the version arm:
-    await engine.executeRaw(`UPDATE pages SET updated_at = '2000-01-01T00:00:00Z' WHERE slug = 'people/alice'`);
+    // Seed a LEGACY stamp directly via raw SQL (markPagesExtractedBatch now
+    // clamps to >= LINK_EXTRACTOR_VERSION_TS — see versionTs-floor tests below —
+    // so an old stamp can only exist from data written before that clamp, e.g.
+    // migrated/pre-fix rows). Isolate the version arm: stamp == updated_at, no
+    // dangling edited-since staleness.
+    await engine.executeRaw(
+      `UPDATE pages SET links_extracted_at = '2000-01-01T00:00:00Z', updated_at = '2000-01-01T00:00:00Z' WHERE slug = 'people/alice'`,
+    );
     expect(await engine.countStalePagesForExtraction()).toBe(0); // no version, stamp==updated, not NULL
     expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(1); // version arm
+  });
+
+  test('markPagesExtractedBatch: clamps the stamp to GREATEST(extractedAt, LINK_EXTRACTOR_VERSION_TS)', async () => {
+    await engine.putPage('people/alice', personPage('Alice'));
+    // Even when the caller passes a pre-version extractedAt (e.g. the page's
+    // own old updated_at), the persisted stamp cannot be older than the
+    // version — the versionTs-floor fix.
+    await engine.markPagesExtractedBatch(
+      [{ slug: 'people/alice', source_id: 'default', extractedAt: '2000-01-01T00:00:00Z' }],
+      new Date().toISOString(),
+    );
+    const stamp = await stampOf('people/alice');
+    expect(stamp).not.toBeNull();
+    expect(new Date(stamp as string).getTime()).toBeGreaterThanOrEqual(new Date(LINK_EXTRACTOR_VERSION_TS).getTime());
   });
 
   test('countStalePagesForExtraction: edited-since arm (CDX-1)', async () => {
@@ -269,6 +291,66 @@ describe('gbrain extract --stale', () => {
     expect(hooked).toBe(true);
     // acme stays stale (only the concurrently-edited page); alice was stamped
     // with its own read updated_at and is fresh.
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(1);
+  });
+
+  test('CRITICAL (versionTs floor): a pre-version untouched page clears after ONE sweep and stays clear', async () => {
+    await engine.putPage('people/alice', personPage('Alice'));
+    await engine.putPage('companies/acme', companyPage('Acme', '[Alice](people/alice) founded [Acme](companies/acme).'));
+    // Simulate pages untouched since before the extractor version bump: both
+    // updated_at and links_extracted_at predate LINK_EXTRACTOR_VERSION_TS and
+    // are EQUAL (no dangling edited-since staleness) — isolates the version arm,
+    // exactly like real rows written before this fix existed.
+    await engine.executeRaw(
+      `UPDATE pages SET updated_at = '2026-05-01T00:00:00Z', links_extracted_at = '2026-05-01T00:00:00Z'`,
+    );
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(2);
+
+    await runExtract(engine, ['--stale']);
+    // Pre-fix bug: markPagesExtractedBatch re-stamped links_extracted_at to the
+    // page's own (still pre-version) read updated_at, so this stayed stale on
+    // EVERY sweep forever. Post-fix: the stamp clamps to
+    // GREATEST(read updated_at, LINK_EXTRACTOR_VERSION_TS), clearing it.
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+
+    // Re-run again — proves it's not one lucky sweep; the pre-fix bug would
+    // show 2 again here, every time, forever (the permanent extract-stale floor).
+    await runExtract(engine, ['--stale']);
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+  });
+
+  test('CRITICAL (versionTs floor + D4 race): a concurrent edit during a version-bump sweep is still NOT masked', async () => {
+    await engine.putPage('companies/acme', companyPage('Acme', 'No links yet.'));
+    // Anchor both timestamps before the version bump — a legacy stale page
+    // about to be swept for the first time post-fix.
+    await engine.executeRaw(
+      `UPDATE pages SET updated_at = '2026-05-01T00:00:00Z', links_extracted_at = '2026-05-01T00:00:00Z' WHERE slug = 'companies/acme'`,
+    );
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(1);
+
+    // Simulate a concurrent edit landing AFTER the list-read but BEFORE the
+    // stamp write — bump updated_at to a real "now" (production edits always
+    // land at now(), long after LINK_EXTRACTOR_VERSION_TS).
+    const origStamp = engine.markPagesExtractedBatch.bind(engine);
+    let hooked = false;
+    (engine as unknown as { markPagesExtractedBatch: unknown }).markPagesExtractedBatch = async (
+      refs: Array<{ slug: string; source_id: string; extractedAt?: string }>, def: string,
+    ) => {
+      if (!hooked) {
+        hooked = true;
+        await engine.executeRaw(`UPDATE pages SET updated_at = now() WHERE slug = 'companies/acme'`);
+      }
+      return origStamp(refs, def);
+    };
+    try {
+      await runExtract(engine, ['--stale']);
+    } finally {
+      (engine as unknown as { markPagesExtractedBatch: unknown }).markPagesExtractedBatch = origStamp;
+    }
+    expect(hooked).toBe(true);
+    // The stamp clamps the STALE READ value ('2026-05-01') up to versionTs, but
+    // the concurrent edit (now(), far past versionTs) still exceeds that
+    // clamped stamp — the edited-since arm correctly re-flags it. Not masked.
     expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(1);
   });
 

@@ -1086,6 +1086,14 @@ export interface BrainEngine {
    * value → the page stays stale → re-extracted next run, never marked
    * fresh-with-the-old-content. Sync / DB-extract sites omit per-ref values and
    * pass `now()` (the page was just imported, so `now() >= updated_at`).
+   *
+   * The persisted stamp is `GREATEST(effective extractedAt, LINK_EXTRACTOR_VERSION_TS)`
+   * — never older than the version stamp, even when the ref's own value
+   * predates it (versionTs floor fix). Without this, a page untouched since
+   * before `LINK_EXTRACTOR_VERSION_TS` would be re-stamped at its own old
+   * `updated_at` on every sweep and permanently re-trip the version arm in
+   * `buildStalePagesWhere`. The clamp only ever raises the stamp, so it can't
+   * mask the D4 race fix above.
    */
   markPagesExtractedBatch(refs: Array<{ slug: string; source_id: string; extractedAt?: string }>, defaultExtractedAt: string): Promise<void>;
 

@@ -17,6 +17,7 @@ import type {
   SourceRow,
 } from './engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
+import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
 import { withRetry, BULK_RETRY_OPTS, resolveBulkRetryOpts, computeNextDelay, type BatchAuditSite } from './retry.ts';
 import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatchExhausted } from './audit/batch-retry-audit.ts';
 import { runMigrations } from './migrate.ts';
@@ -2475,11 +2476,18 @@ export class PGLiteEngine implements BrainEngine {
     // Per-ref timestamp (D4 race fix): extract --stale passes each row's read
     // updated_at; sites that omit it fall back to defaultExtractedAt.
     const tss = refs.map(r => r.extractedAt ?? defaultExtractedAt);
+    // GREATEST-clamp to LINK_EXTRACTOR_VERSION_TS (mirrors PostgresEngine): a
+    // page whose read updated_at predates the version stamp must not persist a
+    // watermark older than the version, or buildStalePagesWhere's version arm
+    // re-trips on every future sweep — a page untouched since before the bump
+    // never clears. Clamping only ever raises the stamp, so the D4 race fix (a
+    // concurrent edit's updated_at, always >= now() >> versionTs in practice,
+    // exceeding the clamped stamp) still re-flags it as stale.
     await this.db.query(
-      `UPDATE pages p SET links_extracted_at = v.ts::timestamptz
+      `UPDATE pages p SET links_extracted_at = GREATEST(v.ts::timestamptz, $4::timestamptz)
          FROM unnest($1::text[], $2::text[], $3::text[]) AS v(slug, source_id, ts)
          WHERE p.slug = v.slug AND p.source_id = v.source_id`,
-      [slugs, srcs, tss],
+      [slugs, srcs, tss, LINK_EXTRACTOR_VERSION_TS],
     );
   }
 

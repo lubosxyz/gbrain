@@ -473,11 +473,25 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     expect(await pgEngine.countStalePagesForExtraction({ sourceId: SRC })).toBe(2);
     expect(await pgliteEngine.countStalePagesForExtraction({ sourceId: SRC })).toBe(2);
 
-    // version arm: stamp sp/2 old + set updated_at old (isolate version arm) →
-    // flagged only when versionTs is passed. Parity on both engines.
+    // versionTs-floor clamp parity: markPagesExtractedBatch persists
+    // GREATEST(extractedAt, LINK_EXTRACTOR_VERSION_TS) on BOTH engines — never a
+    // stamp older than the version, even when the caller passes a pre-version
+    // extractedAt (KOM fork reconcile 2026-07-09).
     for (const eng of [pgEngine, pgliteEngine]) {
-      await eng.markPagesExtractedBatch([{ slug: 'sp/2', source_id: SRC }], '2000-01-01T00:00:00Z');
-      await eng.executeRaw(`UPDATE pages SET updated_at = '2000-01-01T00:00:00Z' WHERE slug = 'sp/2' AND source_id = $1`, [SRC]);
+      await eng.markPagesExtractedBatch([{ slug: 'sp/2', source_id: SRC, extractedAt: '2000-01-01T00:00:00Z' }], stampAt);
+      const [row] = await eng.executeRaw<{ links_extracted_at: string }>(
+        `SELECT links_extracted_at FROM pages WHERE slug = 'sp/2' AND source_id = $1`, [SRC],
+      );
+      expect(new Date(row.links_extracted_at).getTime()).toBeGreaterThanOrEqual(new Date(VER).getTime());
+    }
+
+    // version arm: seed a LEGACY stamp directly via raw SQL (mirrors
+    // extract-stale.test.ts — the clamp above means an old stamp can now only
+    // exist from data written before this fix, e.g. migrated/pre-fix rows).
+    // Isolate the version arm: stamp == updated_at, no dangling edited-since
+    // staleness. Parity on both engines.
+    for (const eng of [pgEngine, pgliteEngine]) {
+      await eng.executeRaw(`UPDATE pages SET links_extracted_at = '2000-01-01T00:00:00Z', updated_at = '2000-01-01T00:00:00Z' WHERE slug = 'sp/2' AND source_id = $1`, [SRC]);
     }
     // Without versionTs: sp/2 not stale (stamp == updated, not NULL). sp/3 still NULL-stale.
     expect(await pgEngine.countStalePagesForExtraction({ sourceId: SRC })).toBe(1);
