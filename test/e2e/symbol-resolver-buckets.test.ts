@@ -117,6 +117,24 @@ describe('unmatched reason buckets', () => {
     expect(stats.unmatched_buckets.bare_token_vs_qualified).toBe(1);
   });
 
+  test('a QUALIFIED target with a mere leaf collision is NOT bare_token_vs_qualified', async () => {
+    // Target `Widget.get`; the page declares `Other.get`. The leaves collide but
+    // the target is not bare, so calling it bare_token_vs_qualified would hide a
+    // genuine miss. It must fall through to the cross-file probe instead.
+    await registerSource(engine, 's');
+    const page = await insertCodePage(engine, 's', 'src/a.ts');
+    const caller = await insertChunk(engine, page, 0, 'caller', 'typescript');
+    await insertChunk(engine, page, 1, 'Other.get', 'typescript');
+    await insertEdge(engine, caller, 'caller', 'Widget.get', 's');
+
+    const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect(stats.unmatched_buckets.bare_token_vs_qualified).toBe(0);
+    // `Widget.get` is declared nowhere → honest unknown (get's leaf being a
+    // builtin doesn't apply: the target is qualified, so isLanguageBuiltin is
+    // false).
+    expect(stats.unmatched_buckets.no_candidate_anywhere).toBe(1);
+  });
+
   test('cross_file_same_source: the definition exists, just not in this file', async () => {
     await registerSource(engine, 's');
     const pageA = await insertCodePage(engine, 's', 'src/a.ts');
@@ -409,6 +427,35 @@ describe('symbolUnmatchedBuckets (committed state)', () => {
       [],
     );
     expect(Number(both[0]!.n)).toBe(0);
+  });
+
+  test('an edge that becomes ambiguous drops its stale resolved_chunk_id', async () => {
+    // One candidate first (resolves), then a duplicate definition appears and a
+    // re-walk sees two (ambiguous). The old resolved_chunk_id must not survive,
+    // or symbolEdgeCoverage would keep counting it as resolved to a stale chunk.
+    await registerSource(engine, 's');
+    const page = await insertCodePage(engine, 's', 'src/a.ts');
+    const caller = await insertChunk(engine, page, 0, 'caller', 'typescript');
+    await insertChunk(engine, page, 1, 'parseInput', 'typescript');
+    await insertEdge(engine, caller, 'caller', 'parseInput', 's');
+
+    await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect((await symbolEdgeCoverage(engine, { sourceId: 's' })).pages_with_resolved_edges).toBe(1);
+
+    // A second chunk with the same qualified name → now ambiguous.
+    await insertChunk(engine, page, 2, 'parseInput', 'typescript');
+    await engine.executeRaw(`UPDATE content_chunks SET edges_backfilled_at = NULL`, []);
+    const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect(stats.edges_ambiguous).toBe(1);
+
+    const both = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM code_edges_symbol
+        WHERE edge_metadata ? 'resolved_chunk_id' AND edge_metadata ? 'ambiguous'`,
+      [],
+    );
+    expect(Number(both[0]!.n)).toBe(0);
+    // And it no longer counts as resolved.
+    expect((await symbolEdgeCoverage(engine, { sourceId: 's' })).pages_with_resolved_edges).toBe(0);
   });
 
   test('a soft-deleted page stops contributing its reasons', async () => {

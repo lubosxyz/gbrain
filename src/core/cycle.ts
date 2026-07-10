@@ -1160,8 +1160,11 @@ async function runPhaseResolveSymbolEdges(
     const coverage = await symbolEdgeCoverage(engine);
     const buckets = await symbolUnmatchedBuckets(engine);
 
-    // Name the dominant reason in the summary — an unmatched count alone reads
-    // as resolver failure when it's usually edges leaving the indexed corpus.
+    // The walk line is THIS tick's work; the graph line is brain-wide committed
+    // state. Keep them apart — a tick that walks 3 chunks must not read
+    // "unmatched 3 (mostly builtin: 10000)", mixing a tick count with a
+    // brain-wide one. The dominant reason belongs to the brain-wide total.
+    const brainUnmatched = UNMATCHED_REASONS.reduce((n, r) => n + buckets[r], 0);
     const topReason = UNMATCHED_REASONS
       .map((reason) => ({ reason, count: buckets[reason] }))
       .filter((b) => b.count > 0)
@@ -1170,17 +1173,20 @@ async function runPhaseResolveSymbolEdges(
     const walkSummary =
       totalChunks === 0
         ? 'no chunks needed symbol resolution'
-        : `${totalChunks} chunk(s) walked; resolved ${totalResolved}, ambiguous ${totalAmbiguous}, unmatched ${totalUnmatched}` +
-          (topReason ? ` (mostly ${topReason.reason}: ${topReason.count})` : '');
+        : `${totalChunks} chunk(s) walked; resolved ${totalResolved}, ambiguous ${totalAmbiguous}, unmatched ${totalUnmatched}`;
+
+    const graphSummary =
+      `graph: page coverage ${coverage.pages_with_resolved_edges}/${coverage.pages_with_edges}` +
+      ` (${(coverage.page_coverage * 100).toFixed(1)}%)` +
+      (brainUnmatched > 0
+        ? `; ${brainUnmatched} unmatched edge(s)` + (topReason ? ` (mostly ${topReason.reason}: ${topReason.count})` : '')
+        : '');
 
     return {
       phase: 'resolve_symbol_edges',
       status: 'ok',
       duration_ms: 0,
-      summary:
-        `${walkSummary}; page coverage ` +
-        `${coverage.pages_with_resolved_edges}/${coverage.pages_with_edges}` +
-        ` (${(coverage.page_coverage * 100).toFixed(1)}%)`,
+      summary: `${walkSummary}; ${graphSummary}`,
       details: {
         chunks_walked: totalChunks,
         edges_resolved: totalResolved,

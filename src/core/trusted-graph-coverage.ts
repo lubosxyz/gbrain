@@ -58,7 +58,7 @@ import {
   FIRST_SEGMENT_EXCLUSIONS,
   PSEUDO_SLUGS,
   RAW_SEGMENT,
-} from '../commands/orphans.ts';
+} from './slug-exclusions.ts';
 
 /**
  * Shorter than a sentence — a write-probe, a stub, or a title with no body.

@@ -209,6 +209,11 @@ function qualifiedLeaf(qualified: string): string {
   return qualified.split(/::|#|\./).pop() ?? qualified;
 }
 
+/** True when the token carries a namespace delimiter (so it is not a bare name). */
+function isQualified(symbol: string): boolean {
+  return /::|#|\./.test(symbol);
+}
+
 /**
  * The edge extractor emits no cross-LANGUAGE calls, but TS/JS variants call
  * across each other freely: a `.ts` caller reaches a symbol in a `.tsx` or `.js`
@@ -402,7 +407,15 @@ async function processChunkBatch(
       noteUnmatched('unsupported_language', e.id);
     } else if ((qualCountByPage.get(pageId) ?? 0) === 0) {
       noteUnmatched('missing_symbol_metadata', e.id);
-    } else if (leavesByPage.get(pageId)?.has(qualifiedLeaf(e.to_symbol_qualified))) {
+    } else if (
+      !isQualified(e.to_symbol_qualified) &&
+      leavesByPage.get(pageId)?.has(e.to_symbol_qualified)
+    ) {
+      // The target is a bare token and the page declares a qualified name whose
+      // leaf is exactly it (`render` here, `Widget.render` there). If the target
+      // were ITSELF qualified, a leaf collision with some OTHER class's method
+      // would be a false diagnosis — that case falls through to the cross-file
+      // probe, which matches the full name.
       noteUnmatched('bare_token_vs_qualified', e.id);
     } else {
       needsCrossFileProbe.push({ edgeId: e.id, target: e.to_symbol_qualified, language });
@@ -480,13 +493,16 @@ async function processChunkBatch(
     }
   }
 
-  // Persist edge metadata updates in batches. Each write strips any
-  // `unmatched_reason` a previous pass left behind: an edge that resolves now
-  // must not keep explaining why it once didn't.
+  // Persist edge metadata updates in batches. Each write strips every OPPOSING
+  // key so the three outcomes (resolved / ambiguous / unmatched) are mutually
+  // exclusive on every transition — a re-walk that changes an edge's verdict
+  // must not leave the old verdict behind for readEdgeResolution /
+  // symbolEdgeCoverage / symbolUnmatchedBuckets to double-count.
   for (const r of toResolve) {
     await engine.executeRaw(
       `UPDATE code_edges_symbol
-          SET edge_metadata = (COALESCE(edge_metadata, '{}'::jsonb) - 'unmatched_reason')
+          SET edge_metadata = (COALESCE(edge_metadata, '{}'::jsonb)
+                                 - 'unmatched_reason' - 'ambiguous' - 'candidates')
                            || jsonb_build_object('resolved_chunk_id', $1::int)
         WHERE id = $2`,
       [r.chunkId, r.edgeId],
@@ -495,7 +511,8 @@ async function processChunkBatch(
   for (const a of toAmbiguous) {
     await engine.executeRaw(
       `UPDATE code_edges_symbol
-          SET edge_metadata = (COALESCE(edge_metadata, '{}'::jsonb) - 'unmatched_reason')
+          SET edge_metadata = (COALESCE(edge_metadata, '{}'::jsonb)
+                                 - 'unmatched_reason' - 'resolved_chunk_id')
                            || jsonb_build_object('ambiguous', true,
                                                  'candidates', $1::text::jsonb)
         WHERE id = $2`,
