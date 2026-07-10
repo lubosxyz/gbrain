@@ -22,8 +22,7 @@
  *     the behaviour we want to reward.
  *   - a machine receipt — `extract_receipt` pages record extraction outcomes.
  *   - empty or boilerplate — under MIN_KNOWLEDGE_CHARS of body text.
- *   - a pseudo/auto page — reuses `shouldExclude` from the orphans command so
- *     "what counts as a real knowledge page" has exactly one definition.
+ *   - a pseudo/auto page — the slug taxonomy of the orphans command.
  *
  * `page_kind IN ('code','image')` is excluded wholesale: code pages live in the
  * symbol graph (see chunkers/symbol-resolver.ts `symbolEdgeCoverage`, the code
@@ -40,10 +39,26 @@
  * Deliberately NOT counted as trusted: kNN / embedding-similarity edges. None
  * are written today, and none should be until the edge model carries a type and
  * provenance — otherwise this metric would score a brain on edges nobody chose.
+ *
+ * ## Why the slug taxonomy is rendered into SQL
+ *
+ * `getHealth()` runs on every autopilot cycle. Streaming one row per markdown
+ * page into JS to call `shouldExclude` would make a previously aggregate-only
+ * health path cost O(markdown pages) of result egress per cycle. So the counts
+ * are aggregated in the database — but the predicate is GENERATED from the very
+ * arrays `shouldExclude` reads (exported from commands/orphans.ts), not
+ * hand-copied into SQL. One source of truth, two evaluators, and
+ * test/trusted-graph-coverage.test.ts pins them to identical verdicts.
  */
 
 import type { BrainEngine } from './engine.ts';
-import { shouldExclude } from '../commands/orphans.ts';
+import {
+  AUTO_SUFFIX_PATTERNS,
+  DENY_PREFIXES,
+  FIRST_SEGMENT_EXCLUSIONS,
+  PSEUDO_SLUGS,
+  RAW_SEGMENT,
+} from '../commands/orphans.ts';
 
 /**
  * Shorter than a sentence — a write-probe, a stub, or a title with no body.
@@ -57,7 +72,7 @@ export const MIN_KNOWLEDGE_CHARS = 40;
 const RAW_CAPTURE_PREFIX = 'inbox/';
 
 /** Page types written by machines to record an outcome, never to hold knowledge. */
-const MACHINE_STUB_TYPES = new Set(['extract_receipt']);
+const MACHINE_STUB_TYPES = ['extract_receipt'];
 
 export interface PagesBySurface {
   /** Live markdown knowledge pages, raw captures excluded. */
@@ -86,11 +101,35 @@ export interface TrustedGraphCoverage {
   };
 }
 
-interface MarkdownPageRow {
-  slug: string;
-  type: string;
-  content_len: number;
-  has_trusted_edge: boolean;
+/**
+ * SQL mirror of `shouldExclude`, rendered from its own constants.
+ *
+ * `left()`/`right()` rather than `LIKE`: the suffix `/_index` contains `_`,
+ * which is a LIKE single-character wildcard, so `slug LIKE '%' || '/_index'`
+ * would also match `/xindex`. Exact substring comparison has no metacharacters.
+ *
+ * `$1..$5` are bound by the caller in this order; `column` is the slug
+ * expression to test (e.g. `p.slug`).
+ */
+export function pseudoOrAutoSlugSql(column: string): string {
+  return `(
+  ${column} = ANY($1::text[])
+  OR EXISTS (SELECT 1 FROM unnest($2::text[]) AS suf WHERE right(${column}, length(suf)) = suf)
+  OR position($3 IN ${column}) > 0
+  OR EXISTS (SELECT 1 FROM unnest($4::text[]) AS pre WHERE left(${column}, length(pre)) = pre)
+  OR split_part(${column}, '/', 1) = ANY($5::text[])
+)`;
+}
+
+/** Params for PSEUDO_OR_AUTO_SLUG_SQL, in placeholder order. */
+export function pseudoOrAutoSlugParams(): unknown[] {
+  return [
+    Array.from(PSEUDO_SLUGS),
+    AUTO_SUFFIX_PATTERNS,
+    RAW_SEGMENT,
+    DENY_PREFIXES,
+    Array.from(FIRST_SEGMENT_EXCLUSIONS),
+  ];
 }
 
 /**
@@ -101,63 +140,79 @@ interface MarkdownPageRow {
 const TRUSTED_LINK_PREDICATE = `l.link_source IS DISTINCT FROM 'mentions'`;
 
 export async function computeTrustedGraphCoverage(engine: BrainEngine): Promise<TrustedGraphCoverage> {
-  // Filter what SQL filters cheaply (kind, liveness); hand the rest to
-  // `shouldExclude` so the slug taxonomy has a single home. Bounded by the
-  // markdown page count, which is orders of magnitude below the code-chunk count
-  // this metric exists to ignore.
-  const rows = await engine.executeRaw<MarkdownPageRow>(
-    `SELECT
-       p.slug,
-       p.type,
-       length(btrim(p.compiled_truth))::int AS content_len,
-       (
-         EXISTS (
-           SELECT 1 FROM links l
-           JOIN pages src ON src.id = l.from_page_id
-           WHERE l.to_page_id = p.id AND src.deleted_at IS NULL AND ${TRUSTED_LINK_PREDICATE}
+  const params = [
+    ...pseudoOrAutoSlugParams(),          // $1..$5
+    `${RAW_CAPTURE_PREFIX}`,              // $6
+    MACHINE_STUB_TYPES,                   // $7
+    MIN_KNOWLEDGE_CHARS,                  // $8
+  ];
+
+  // The trusted-edge EXISTS runs only over rows that survived classification,
+  // so an excluded page never pays for a link probe.
+  const rows = await engine.executeRaw<{
+    raw_capture: number;
+    machine_stub: number;
+    empty_or_boilerplate: number;
+    pseudo_or_auto: number;
+    eligible: number;
+    covered: number;
+  }>(
+    `WITH classified AS (
+       SELECT
+         p.id,
+         CASE
+           WHEN left(p.slug, length($6)) = $6 THEN 'raw_capture'
+           WHEN p.type = ANY($7::text[]) THEN 'machine_stub'
+           WHEN length(btrim(p.compiled_truth)) < $8 THEN 'empty_or_boilerplate'
+           WHEN ${pseudoOrAutoSlugSql('p.slug')} THEN 'pseudo_or_auto'
+           ELSE 'eligible'
+         END AS bucket
+       FROM pages p
+       WHERE p.deleted_at IS NULL
+         AND p.page_kind = 'markdown'
+     ),
+     covered AS (
+       SELECT count(*)::int AS n
+       FROM classified c
+       WHERE c.bucket = 'eligible'
+         AND (
+           EXISTS (
+             SELECT 1 FROM links l
+             JOIN pages src ON src.id = l.from_page_id
+             WHERE l.to_page_id = c.id AND src.deleted_at IS NULL AND ${TRUSTED_LINK_PREDICATE}
+           )
+           OR EXISTS (
+             SELECT 1 FROM links l
+             JOIN pages dst ON dst.id = l.to_page_id
+             WHERE l.from_page_id = c.id AND dst.deleted_at IS NULL AND ${TRUSTED_LINK_PREDICATE}
+           )
          )
-         OR EXISTS (
-           SELECT 1 FROM links l
-           JOIN pages dst ON dst.id = l.to_page_id
-           WHERE l.from_page_id = p.id AND dst.deleted_at IS NULL AND ${TRUSTED_LINK_PREDICATE}
-         )
-       ) AS has_trusted_edge
-     FROM pages p
-     WHERE p.deleted_at IS NULL
-       AND p.page_kind = 'markdown'`,
-    [],
+     )
+     SELECT
+       count(*) FILTER (WHERE bucket = 'raw_capture')::int AS raw_capture,
+       count(*) FILTER (WHERE bucket = 'machine_stub')::int AS machine_stub,
+       count(*) FILTER (WHERE bucket = 'empty_or_boilerplate')::int AS empty_or_boilerplate,
+       count(*) FILTER (WHERE bucket = 'pseudo_or_auto')::int AS pseudo_or_auto,
+       count(*) FILTER (WHERE bucket = 'eligible')::int AS eligible,
+       (SELECT n FROM covered) AS covered
+     FROM classified`,
+    params,
   );
 
-  const excluded = { raw_capture: 0, machine_stub: 0, empty_or_boilerplate: 0, pseudo_or_auto: 0 };
-  let eligible_pages = 0;
-  let covered_pages = 0;
-
-  for (const row of rows) {
-    if (row.slug.startsWith(RAW_CAPTURE_PREFIX)) {
-      excluded.raw_capture += 1;
-      continue;
-    }
-    if (MACHINE_STUB_TYPES.has(row.type)) {
-      excluded.machine_stub += 1;
-      continue;
-    }
-    if (Number(row.content_len) < MIN_KNOWLEDGE_CHARS) {
-      excluded.empty_or_boilerplate += 1;
-      continue;
-    }
-    if (shouldExclude(row.slug)) {
-      excluded.pseudo_or_auto += 1;
-      continue;
-    }
-    eligible_pages += 1;
-    if (row.has_trusted_edge) covered_pages += 1;
-  }
+  const r = rows[0];
+  const eligible_pages = Number(r?.eligible ?? 0);
+  const covered_pages = Number(r?.covered ?? 0);
 
   return {
     eligible_pages,
     covered_pages,
     coverage: eligible_pages > 0 ? covered_pages / eligible_pages : 0,
-    excluded,
+    excluded: {
+      raw_capture: Number(r?.raw_capture ?? 0),
+      machine_stub: Number(r?.machine_stub ?? 0),
+      empty_or_boilerplate: Number(r?.empty_or_boilerplate ?? 0),
+      pseudo_or_auto: Number(r?.pseudo_or_auto ?? 0),
+    },
   };
 }
 
@@ -165,12 +220,12 @@ export async function computePagesBySurface(engine: BrainEngine): Promise<PagesB
   const rows = await engine.executeRaw<{ page_kind: string; raw_capture: number; total: number }>(
     `SELECT
        p.page_kind,
-       count(*) FILTER (WHERE p.slug LIKE $1)::int AS raw_capture,
+       count(*) FILTER (WHERE left(p.slug, length($1)) = $1)::int AS raw_capture,
        count(*)::int AS total
      FROM pages p
      WHERE p.deleted_at IS NULL
      GROUP BY p.page_kind`,
-    [`${RAW_CAPTURE_PREFIX}%`],
+    [RAW_CAPTURE_PREFIX],
   );
 
   const surface: PagesBySurface = { prose: 0, code: 0, image: 0, raw_capture: 0 };

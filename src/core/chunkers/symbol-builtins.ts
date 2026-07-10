@@ -123,14 +123,19 @@ const BY_LANGUAGE: Record<string, ReadonlySet<string>[]> = {
  * unknowable before resolution). Unknown languages return false: we would
  * rather bucket an edge as `no_candidate_anywhere` than assert a reason we
  * cannot support.
+ *
+ * BARE targets only. A qualified target such as `Widget::get` or `Client.join`
+ * has a user-owned namespace; matching its leaf against `get`/`join` would file
+ * a real resolver miss under "that's just stdlib" and hide it. The namespace
+ * never proves the symbol is external, so we decline to guess — a qualified
+ * target that reaches this classifier belongs in `no_candidate_anywhere`.
+ * The cost is small: real corpora emit builtins bare (`string`, `trim`, `map`),
+ * because that is how the extractor tokenizes a method call.
  */
 export function isLanguageBuiltin(symbol: string, language: string | null | undefined): boolean {
   if (!symbol || !language) return false;
+  if (/::|\.|#/.test(symbol)) return false;
   const sets = BY_LANGUAGE[language];
   if (!sets) return false;
-  // Qualified targets (`tempfile::TemporaryDirectory`, `os.path.join`) are
-  // matched on their final segment: the namespace tells us it's external, the
-  // leaf tells us what it is.
-  const leaf = symbol.split(/::|\./).pop() ?? symbol;
-  return sets.some((s) => s.has(symbol) || s.has(leaf));
+  return sets.some((s) => s.has(symbol));
 }

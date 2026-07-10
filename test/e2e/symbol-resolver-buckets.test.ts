@@ -173,6 +173,53 @@ describe('unmatched reason buckets', () => {
     expect(stats.unmatched_buckets.builtin_or_external).toBe(0);
   });
 
+
+  test('a registered language without a LANG_CONFIG entry is NOT unsupported', async () => {
+    // buildQualifiedName falls back to a dot-joined scope path for C#, C++, PHP
+    // and friends, so their chunks DO enter the candidate index and DO resolve.
+    // Bucketing them as `unsupported_language` would hide a real cross-file miss
+    // behind a reason that isn't true.
+    await registerSource(engine, 's');
+    const pageA = await insertCodePage(engine, 's', 'src/a.cs');
+    const pageB = await insertCodePage(engine, 's', 'src/b.cs');
+    const caller = await insertChunk(engine, pageA, 0, 'Caller', 'c_sharp');
+    await insertChunk(engine, pageB, 0, 'ParseInput', 'c_sharp');
+    await insertEdge(engine, caller, 'Caller', 'ParseInput', 's');
+
+    const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect(stats.unmatched_buckets.unsupported_language).toBe(0);
+    expect(stats.unmatched_buckets.cross_file_same_source).toBe(1);
+  });
+
+  test('a QUALIFIED target is never written off as a builtin', async () => {
+    // `Widget::get` has a user-owned namespace. Matching its leaf against `get`
+    // would file a real resolver miss under "that's just stdlib".
+    await registerSource(engine, 's');
+    const page = await insertCodePage(engine, 's', 'src/a.ts');
+    const caller = await insertChunk(engine, page, 0, 'caller', 'typescript');
+    await insertEdge(engine, caller, 'caller', 'Widget.get', 's');
+
+    const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect(stats.unmatched_buckets.builtin_or_external).toBe(0);
+    expect(stats.unmatched_buckets.no_candidate_anywhere).toBe(1);
+  });
+
+  test('a bare target matching a user symbol elsewhere beats the builtin list', async () => {
+    // The extractor emits bare `get`; the definition is stored qualified as
+    // `Widget.get`, so the exact-name probe misses. The bare-name arm catches it.
+    // Without that arm this project's own method reads as stdlib.
+    await registerSource(engine, 's');
+    const pageA = await insertCodePage(engine, 's', 'src/a.ts');
+    const pageB = await insertCodePage(engine, 's', 'src/b.ts');
+    const caller = await insertChunk(engine, pageA, 0, 'caller', 'typescript');
+    await insertChunkRaw(engine, pageB, 0, { language: 'typescript', qualified: 'Widget.get', bare: 'get' });
+    await insertEdge(engine, caller, 'caller', 'get', 's');
+
+    const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect(stats.unmatched_buckets.cross_file_same_source).toBe(1);
+    expect(stats.unmatched_buckets.builtin_or_external).toBe(0);
+  });
+
   test('no_candidate_anywhere is the honest fallback', async () => {
     await registerSource(engine, 's');
     const page = await insertCodePage(engine, 's', 'src/a.ts');
@@ -212,6 +259,23 @@ describe('symbolEdgeCoverage', () => {
     expect(second.edges_resolved).toBe(0);
     const again = await symbolEdgeCoverage(engine, { sourceId: 's' });
     expect(again.page_coverage).toBeCloseTo(0.5, 5);
+  });
+
+  test('a soft-deleted page leaves both numerator and denominator', async () => {
+    await registerSource(engine, 's');
+    const pageA = await insertCodePage(engine, 's', 'src/a.ts');
+    const callerA = await insertChunk(engine, pageA, 0, 'callerA', 'typescript');
+    await insertChunk(engine, pageA, 1, 'parseInput', 'typescript');
+    await insertEdge(engine, callerA, 'callerA', 'parseInput', 's');
+    await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+
+    expect((await symbolEdgeCoverage(engine, { sourceId: 's' })).pages_with_edges).toBe(1);
+
+    await engine.executeRaw(`UPDATE pages SET deleted_at = NOW() WHERE id = $1`, [pageA]);
+    const cov = await symbolEdgeCoverage(engine, { sourceId: 's' });
+    expect(cov.pages_with_edges).toBe(0);
+    expect(cov.pages_with_resolved_edges).toBe(0);
+    expect(cov.page_coverage).toBe(0);
   });
 
   test('a brain with no code edges reports 0, not NaN', async () => {
@@ -257,13 +321,13 @@ async function insertChunkRaw(
   engine: PGLiteEngine,
   pageId: number,
   chunkIndex: number,
-  meta: { language: string | null; qualified: string | null },
+  meta: { language: string | null; qualified: string | null; bare?: string | null },
 ): Promise<number> {
   const rows = await engine.executeRaw<{ id: number }>(
-    `INSERT INTO content_chunks (page_id, chunk_index, chunk_text, chunk_source, language, symbol_name_qualified, symbol_type)
-     VALUES ($1, $2, $3, 'compiled_truth', $4, $5, 'function')
+    `INSERT INTO content_chunks (page_id, chunk_index, chunk_text, chunk_source, language, symbol_name_qualified, symbol_name, symbol_type)
+     VALUES ($1, $2, $3, 'compiled_truth', $4, $5, $6, 'function')
      RETURNING id`,
-    [pageId, chunkIndex, `// chunk ${chunkIndex}`, meta.language, meta.qualified],
+    [pageId, chunkIndex, `// chunk ${chunkIndex}`, meta.language, meta.qualified, meta.bare ?? null],
   );
   return rows[0]!.id;
 }

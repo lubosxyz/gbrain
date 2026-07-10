@@ -33,6 +33,7 @@
  */
 
 import type { SupportedCodeLanguage } from './code.ts';
+import { listRegisteredLanguages } from './code.ts';
 
 interface QualifiedNameConfig {
   /** Delimiter between namespace segments (e.g. '::' for Ruby, '.' for Python). */
@@ -65,15 +66,22 @@ const LANG_CONFIG: Partial<Record<SupportedCodeLanguage, QualifiedNameConfig>> =
 };
 
 /**
- * True when the language has a qualified-name convention here, i.e. its
- * chunks can become candidates in the symbol resolver's index at all. A
- * language absent from LANG_CONFIG yields `symbol_name_qualified = NULL` for
- * every chunk, so every edge out of it is structurally unresolvable — that's
- * a reason to report, not a resolver failure.
+ * True when the chunker can name a symbol in this language, i.e. its chunks can
+ * become candidates in the symbol resolver's index at all.
+ *
+ * NOT the same as "present in LANG_CONFIG". `buildQualifiedName` falls back to a
+ * dot-joined scope path for any registered language it has no delimiter config
+ * for (C#, C++, C, PHP, Swift, …), so those chunks DO carry
+ * `symbol_name_qualified` and DO resolve. Gating on LANG_CONFIG would make the
+ * resolver report `unsupported_language` for a C# edge whose definition sits one
+ * file away — masking a real miss behind a reason that isn't true.
+ *
+ * Only a language the chunker never registered (so it produced no symbols at
+ * all) is genuinely unsupported.
  */
 export function supportsQualifiedNames(language: string | null | undefined): boolean {
   if (!language) return false;
-  return Object.prototype.hasOwnProperty.call(LANG_CONFIG, language);
+  return listRegisteredLanguages().includes(language);
 }
 
 /**

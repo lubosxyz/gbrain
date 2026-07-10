@@ -35,16 +35,16 @@ export interface OrphanResult {
 // --- Filter constants ---
 
 /** Slug suffixes that are always auto-generated root files */
-const AUTO_SUFFIX_PATTERNS = ['/_index', '/log'];
+export const AUTO_SUFFIX_PATTERNS = ['/_index', '/log'];
 
 /** Page slugs that are pseudo-pages by convention */
-const PSEUDO_SLUGS = new Set(['_atlas', '_index', '_stats', '_orphans', '_scratch', 'claude']);
+export const PSEUDO_SLUGS = new Set(['_atlas', '_index', '_stats', '_orphans', '_scratch', 'claude']);
 
 /** Slug segment that marks raw sources */
-const RAW_SEGMENT = '/raw/';
+export const RAW_SEGMENT = '/raw/';
 
 /** Slug prefixes where no inbound links is expected */
-const DENY_PREFIXES = [
+export const DENY_PREFIXES = [
   'output/',
   'dashboards/',
   'scripts/',
@@ -53,7 +53,7 @@ const DENY_PREFIXES = [
 ];
 
 /** First slug segments where no inbound links is expected */
-const FIRST_SEGMENT_EXCLUSIONS = new Set(['scratch', 'thoughts', 'catalog', 'entities']);
+export const FIRST_SEGMENT_EXCLUSIONS = new Set(['scratch', 'thoughts', 'catalog', 'entities']);
 
 // --- Filter logic ---
 

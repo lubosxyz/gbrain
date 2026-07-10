@@ -71,8 +71,14 @@ import { isLanguageBuiltin } from './symbol-builtins.ts';
  * 2026-05-14T01:00:00Z — v0.34 W2: edge-extractor now emits `imports`
  * and `references` edges alongside calls. JS/TS/TSX + Python get imports;
  * TS only gets references.
+ * 2026-07-10T00:00:00Z — resolver shape change: unmatched edges are classified
+ * into reason buckets. Without a bump every existing brain's watermark already
+ * sits past the old stamp, so the resolver would walk zero chunks, the buckets
+ * would report all-zero forever, and the brains that most need the diagnosis
+ * (metadata-wiped ones) would look clean. The re-walk is DB-only — no LLM, no
+ * embeddings — and resumes across cycles via the same watermark.
  */
-export const EDGE_EXTRACTOR_VERSION_TS = '2026-05-14T01:00:00Z';
+export const EDGE_EXTRACTOR_VERSION_TS = '2026-07-10T00:00:00Z';
 
 export const BATCH_SIZE = 200;
 
@@ -100,9 +106,10 @@ export type UnmatchedReason =
    *  (index has `Class.render`, the edge points at bare `render`). Fix =
    *  emit receiver-qualified targets in edge-extractor.ts. */
   | 'bare_token_vs_qualified'
-  /** A chunk in ANOTHER page of the same source carries exactly this qualified
-   *  name. Resolvable only by widening the resolver past same-file scope —
-   *  deliberately out of scope for this pass. */
+  /** A live page elsewhere in this source declares that symbol — under exactly
+   *  this qualified name, or under this bare name. The definition is real and
+   *  only the same-file scope kept us from it. Resolvable by widening the
+   *  resolver, which is deliberately out of scope for this pass. */
   | 'cross_file_same_source'
   /** Target is a language builtin, global, or stdlib member — an edge leaving
    *  the indexed corpus. Not a failure. */
@@ -378,16 +385,26 @@ async function processChunkBatch(
   // builtin classifier, then to the honest unknown bucket.
   if (needsCrossFileProbe.length > 0) {
     const targets = Array.from(new Set(needsCrossFileProbe.map((p) => p.target)));
-    const rows = await engine.executeRaw<{ symbol_name_qualified: string }>(
-      `SELECT DISTINCT cc.symbol_name_qualified
+    // Match the target BOTH ways. `symbol_name_qualified` catches an exact hit;
+    // `symbol_name` (the bare name) catches the far more common shape, where the
+    // extractor emitted a bare `get` and the definition is stored qualified as
+    // `Widget.get`. Without the bare arm, a project's own `get()` one file over
+    // falls through to the builtin classifier and a real resolver miss is
+    // written off as stdlib.
+    const rows = await engine.executeRaw<{ symbol_name_qualified: string | null; symbol_name: string | null }>(
+      `SELECT DISTINCT cc.symbol_name_qualified, cc.symbol_name
          FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
         WHERE p.source_id = $1
           AND p.deleted_at IS NULL
-          AND cc.symbol_name_qualified = ANY($2::text[])`,
+          AND (cc.symbol_name_qualified = ANY($2::text[]) OR cc.symbol_name = ANY($2::text[]))`,
       [sourceId, targets],
     );
-    const declaredInSource = new Set(rows.map((r) => r.symbol_name_qualified));
+    const declaredInSource = new Set<string>();
+    for (const r of rows) {
+      if (r.symbol_name_qualified) declaredInSource.add(r.symbol_name_qualified);
+      if (r.symbol_name) declaredInSource.add(r.symbol_name);
+    }
 
     for (const { target, language } of needsCrossFileProbe) {
       if (declaredInSource.has(target)) {
@@ -480,13 +497,18 @@ export async function symbolEdgeCoverage(
     params.push(opts.sourceId);
     scope = `WHERE e.source_id = $${params.length}`;
   }
+  // `pages` is joined only to drop soft-deleted rows: their chunks and edges
+  // survive until purge, and a hidden page belongs in neither the numerator nor
+  // the denominator. Mirrors the cross-file probe's liveness rule.
+  const deletedFilter = scope ? 'AND p.deleted_at IS NULL' : 'WHERE p.deleted_at IS NULL';
   const rows = await engine.executeRaw<{ pages_resolved: number; pages_with_edges: number }>(
     `SELECT
        count(DISTINCT cc.page_id) FILTER (WHERE e.edge_metadata ? 'resolved_chunk_id')::int AS pages_resolved,
        count(DISTINCT cc.page_id)::int AS pages_with_edges
      FROM code_edges_symbol e
      JOIN content_chunks cc ON cc.id = e.from_chunk_id
-     ${scope}`,
+     JOIN pages p ON p.id = cc.page_id
+     ${scope} ${deletedFilter}`,
     params,
   );
   const pages_with_resolved_edges = Number(rows[0]?.pages_resolved ?? 0);

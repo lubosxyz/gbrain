@@ -3,8 +3,11 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   computeTrustedGraphCoverage,
   computePagesBySurface,
+  pseudoOrAutoSlugSql,
+  pseudoOrAutoSlugParams,
   MIN_KNOWLEDGE_CHARS,
 } from '../src/core/trusted-graph-coverage.ts';
+import { shouldExclude } from '../src/commands/orphans.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 
 const BODY = 'x'.repeat(MIN_KNOWLEDGE_CHARS + 10);
@@ -128,5 +131,54 @@ describe('trusted_graph_coverage', () => {
     expect(h.trusted_graph_coverage).toBe(1);
     expect(h.trusted_graph_eligible_pages).toBe(2);
     expect(h.pages_by_surface).toEqual({ prose: 2, code: 1, image: 0, raw_capture: 0 });
+  });
+});
+
+describe('the SQL slug predicate never drifts from shouldExclude()', () => {
+  // computeTrustedGraphCoverage aggregates in the database for cost, so the
+  // taxonomy exists twice: once as TS control flow, once as SQL. Both are
+  // generated from the same arrays; this pins them to identical verdicts so a
+  // future edit to one cannot silently change the metric.
+  const CORPUS = [
+    '_atlas', '_index', '_stats', '_orphans', '_scratch', 'claude',
+    'people/alice/_index', 'projects/log', 'sources/raw/dump',
+    'output/report', 'dashboards/main', 'scripts/build', 'templates/new-person',
+    'openclaw/config/base', 'scratch/idea', 'thoughts/monday',
+    'catalog/items', 'entities/acme',
+    // Near-misses that must NOT be excluded.
+    'concepts/alpha', 'people/alice', 'notes/xindex', 'notes/blog',
+    'outputs/report', 'scratchpad/idea', 'raw/thing', 'a/raw',
+    'catalogue/items', 'entity/acme', 'logs/monday',
+  ];
+
+  test('every slug in the corpus gets the same verdict from both evaluators', async () => {
+    const rows = await engine.executeRaw<{ slug: string; excluded: boolean }>(
+      `SELECT slug, ${pseudoOrAutoSlugSql('slug')} AS excluded
+         FROM unnest($6::text[]) AS slug`,
+      [...pseudoOrAutoSlugParams(), CORPUS],
+    );
+    expect(rows.length).toBe(CORPUS.length);
+
+    const disagreements = rows
+      .filter((r) => r.excluded !== shouldExclude(r.slug))
+      .map((r) => `${r.slug}: sql=${r.excluded} ts=${shouldExclude(r.slug)}`);
+    expect(disagreements).toEqual([]);
+
+    // Guard against a vacuous pass: the corpus must exercise both verdicts.
+    expect(rows.some((r) => r.excluded)).toBe(true);
+    expect(rows.some((r) => !r.excluded)).toBe(true);
+  });
+
+  test('the auto-suffix match is exact, not a LIKE wildcard', async () => {
+    // `/_index` contains `_`, a LIKE single-char wildcard. `notes/xindex` must
+    // survive; `notes/_index` must not.
+    const rows = await engine.executeRaw<{ slug: string; excluded: boolean }>(
+      `SELECT slug, ${pseudoOrAutoSlugSql('slug')} AS excluded
+         FROM unnest($6::text[]) AS slug`,
+      [...pseudoOrAutoSlugParams(), ['notes/xindex', 'notes/_index']],
+    );
+    const verdict = Object.fromEntries(rows.map((r) => [r.slug, r.excluded]));
+    expect(verdict['notes/xindex']).toBe(false);
+    expect(verdict['notes/_index']).toBe(true);
   });
 });
