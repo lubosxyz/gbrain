@@ -65,6 +65,18 @@ const LANG_CONFIG: Partial<Record<SupportedCodeLanguage, QualifiedNameConfig>> =
 };
 
 /**
+ * True when the language has a qualified-name convention here, i.e. its
+ * chunks can become candidates in the symbol resolver's index at all. A
+ * language absent from LANG_CONFIG yields `symbol_name_qualified = NULL` for
+ * every chunk, so every edge out of it is structurally unresolvable — that's
+ * a reason to report, not a resolver failure.
+ */
+export function supportsQualifiedNames(language: string | null | undefined): boolean {
+  if (!language) return false;
+  return Object.prototype.hasOwnProperty.call(LANG_CONFIG, language);
+}
+
+/**
  * Build a qualified name from the chunker's per-chunk metadata. Returns
  * null when the inputs aren't enough to form a usable identity — callers
  * skip those chunks for edge extraction.
