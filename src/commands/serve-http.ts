@@ -950,25 +950,90 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   app.get('/admin/api/agents', requireAdmin, async (_req: Request, res: Response) => {
     try {
-      // Unified view: OAuth clients + legacy API keys
-      const oauthClients = await sql`
-        SELECT c.client_id as id, c.client_name as name, 'oauth' as auth_type,
-          c.grant_types, c.scope, c.created_at, c.token_ttl,
-          CASE WHEN c.deleted_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
-          (SELECT max(created_at) FROM mcp_request_log WHERE token_name = c.client_id) as last_used_at,
-          (SELECT count(*)::int FROM mcp_request_log WHERE token_name = c.client_id) as total_requests,
-          (SELECT count(*)::int FROM mcp_request_log WHERE token_name = c.client_id AND created_at > now() - interval '24 hours') as requests_today
-        FROM oauth_clients c ORDER BY c.created_at DESC
-      `;
-      const legacyKeys = await sql`
-        SELECT a.id, a.name, 'api_key' as auth_type,
-          '{"bearer"}' as grant_types, 'read write admin' as scope, a.created_at, null as token_ttl,
-          CASE WHEN a.revoked_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
-          a.last_used_at,
-          (SELECT count(*)::int FROM mcp_request_log WHERE token_name = a.name) as total_requests,
-          (SELECT count(*)::int FROM mcp_request_log WHERE token_name = a.name AND created_at > now() - interval '24 hours') as requests_today
-        FROM access_tokens a ORDER BY a.created_at DESC
-      `;
+      // Unified view: OAuth clients + legacy API keys.
+      //
+      // KOM-277: total_requests/last_used_at are otherwise computed LIVE over
+      // mcp_request_log, which the cycle purge phase now prunes on a TTL
+      // (purgeStaleMcpRequestLog, src/core/mcp-request-log-retention.ts). Each
+      // purged batch folds its per-token count + max(created_at) into
+      // mcp_request_log_purged (migration v123) before deleting, so both
+      // metrics here add the purged counters back into the live aggregate.
+      // requests_today / error_rate stay live-only (24h window never reaches
+      // the >=30-day-old rows this purge touches).
+      //
+      // The purged-counter table is referenced ONLY when it exists: on a
+      // pre-v123 / failed-migration brain, referencing it in a scalar subquery
+      // would fail to plan ("relation does not exist") and 503 the whole
+      // endpoint. So gate on to_regclass and fall back to the live-only
+      // expressions — GREATEST/COALESCE handle a token with no purged row, and
+      // this handles a brain with no purged table at all.
+      //
+      // access_tokens.last_used_at (legacy keys) is a directly-maintained
+      // column (debounced UPDATE in oauth-provider.ts), NOT derived from
+      // mcp_request_log — purging doesn't affect it, so only total_requests
+      // needs the purged-counter fix on that side.
+      //
+      // total_requests stays ::int (int4). Codex flagged a theoretical int4
+      // overflow at ~2.1B requests/token, but ::bigint is the WRONG fix here:
+      // this engine configures postgres.js with `types: { bigint: postgres.BigInt }`
+      // (postgres-engine.ts:189), so a bigint column deserializes to a JS
+      // BigInt, which res.json()/JSON.stringify cannot serialize (throws → 500).
+      // int4 is safe: the whole log is ~246k rows brain-wide and a per-token
+      // lifetime count of 2.1B is four orders of magnitude beyond reality.
+      // `sql` here is the engine adapter (sqlQueryForEngine), which only
+      // accepts scalar bind values — it cannot interpolate a SQL fragment. So
+      // the purged-table branch is a whole-query fork, not a fragment splice.
+      const hasPurgedTable = Boolean(
+        (await sql`SELECT to_regclass('mcp_request_log_purged') IS NOT NULL AS ok`)[0]?.ok,
+      );
+
+      const oauthClients = hasPurgedTable
+        ? await sql`
+            SELECT c.client_id as id, c.client_name as name, 'oauth' as auth_type,
+              c.grant_types, c.scope, c.created_at, c.token_ttl,
+              CASE WHEN c.deleted_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
+              GREATEST(
+                (SELECT max(created_at) FROM mcp_request_log WHERE token_name = c.client_id),
+                (SELECT purged_last_used_at FROM mcp_request_log_purged WHERE token_name = c.client_id)
+              ) as last_used_at,
+              (
+                (SELECT count(*) FROM mcp_request_log WHERE token_name = c.client_id)
+                + COALESCE((SELECT purged_requests FROM mcp_request_log_purged WHERE token_name = c.client_id), 0)
+              )::int as total_requests,
+              (SELECT count(*)::int FROM mcp_request_log WHERE token_name = c.client_id AND created_at > now() - interval '24 hours') as requests_today
+            FROM oauth_clients c ORDER BY c.created_at DESC
+          `
+        : await sql`
+            SELECT c.client_id as id, c.client_name as name, 'oauth' as auth_type,
+              c.grant_types, c.scope, c.created_at, c.token_ttl,
+              CASE WHEN c.deleted_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
+              (SELECT max(created_at) FROM mcp_request_log WHERE token_name = c.client_id) as last_used_at,
+              (SELECT count(*)::int FROM mcp_request_log WHERE token_name = c.client_id) as total_requests,
+              (SELECT count(*)::int FROM mcp_request_log WHERE token_name = c.client_id AND created_at > now() - interval '24 hours') as requests_today
+            FROM oauth_clients c ORDER BY c.created_at DESC
+          `;
+      const legacyKeys = hasPurgedTable
+        ? await sql`
+            SELECT a.id, a.name, 'api_key' as auth_type,
+              '{"bearer"}' as grant_types, 'read write admin' as scope, a.created_at, null as token_ttl,
+              CASE WHEN a.revoked_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
+              a.last_used_at,
+              (
+                (SELECT count(*) FROM mcp_request_log WHERE token_name = a.name)
+                + COALESCE((SELECT purged_requests FROM mcp_request_log_purged WHERE token_name = a.name), 0)
+              )::int as total_requests,
+              (SELECT count(*)::int FROM mcp_request_log WHERE token_name = a.name AND created_at > now() - interval '24 hours') as requests_today
+            FROM access_tokens a ORDER BY a.created_at DESC
+          `
+        : await sql`
+            SELECT a.id, a.name, 'api_key' as auth_type,
+              '{"bearer"}' as grant_types, 'read write admin' as scope, a.created_at, null as token_ttl,
+              CASE WHEN a.revoked_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
+              a.last_used_at,
+              (SELECT count(*)::int FROM mcp_request_log WHERE token_name = a.name) as total_requests,
+              (SELECT count(*)::int FROM mcp_request_log WHERE token_name = a.name AND created_at > now() - interval '24 hours') as requests_today
+            FROM access_tokens a ORDER BY a.created_at DESC
+          `;
       res.json([...oauthClients, ...legacyKeys]);
     } catch (e) {
       res.status(503).json({ error: 'service_unavailable' });

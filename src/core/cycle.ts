@@ -1314,6 +1314,19 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     } catch {
       // Non-fatal.
     }
+    // KOM-277 — TTL-based GC of mcp_request_log (append-only MCP usage log,
+    // no FK either direction, unbounded growth otherwise: ~57MB/month on a
+    // representative brain). Best-effort: purgeStaleMcpRequestLog itself
+    // fail-closes to 0 when mcp_request_log_purged doesn't exist yet
+    // (pre-v123 brains), but this try/catch also guards against the import
+    // itself failing on an even older binary layout.
+    let purgedMcpRequestLog = 0;
+    try {
+      const { purgeStaleMcpRequestLog } = await import('./mcp-request-log-retention.ts');
+      purgedMcpRequestLog = await purgeStaleMcpRequestLog(engine);
+    } catch {
+      // Non-fatal.
+    }
     return {
       phase: 'purge',
       status: 'ok',
@@ -1323,7 +1336,8 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
         `${purgedClones.count} orphan clone temp dir(s), ${purgedCheckpoints} stale op_checkpoint(s), ` +
         `${purgedBrainstormCheckpoints} stale brainstorm checkpoint(s), ` +
         `${purgedBatchRetryAuditFiles} stale batch-retry audit file(s), ` +
-        `and ${purgedVolunteerEvents} stale volunteer event(s)`,
+        `${purgedVolunteerEvents} stale volunteer event(s), ` +
+        `and ${purgedMcpRequestLog} stale mcp_request_log row(s)`,
       details: {
         purged_sources_count: purgedSources.length,
         purged_pages_count: purgedPages.count,
@@ -1335,6 +1349,7 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
         purged_brainstorm_checkpoints_count: purgedBrainstormCheckpoints,
         purged_batch_retry_audit_files_count: purgedBatchRetryAuditFiles,
         purged_volunteer_events_count: purgedVolunteerEvents,
+        purged_mcp_request_log_count: purgedMcpRequestLog,
       },
     };
   } catch (e) {

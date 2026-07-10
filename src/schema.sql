@@ -701,6 +701,19 @@ CREATE INDEX IF NOT EXISTS idx_mcp_log_time_agent ON mcp_request_log(created_at,
 CREATE INDEX IF NOT EXISTS idx_mcp_log_agent_time ON mcp_request_log(agent_name, created_at DESC);
 
 -- ============================================================
+-- mcp_request_log_purged: running per-token counters (KOM-277 retention)
+-- ============================================================
+-- The purge phase (src/core/mcp-request-log-retention.ts) deletes stale
+-- mcp_request_log rows on a TTL and folds their per-token count/max(created_at)
+-- into this table, so serve-http's admin metrics can add the purged counters
+-- back into the live COUNT(*)/max(created_at) aggregate. See migration v123.
+CREATE TABLE IF NOT EXISTS mcp_request_log_purged (
+  token_name          TEXT PRIMARY KEY,
+  purged_requests     BIGINT NOT NULL DEFAULT 0,
+  purged_last_used_at TIMESTAMPTZ
+);
+
+-- ============================================================
 -- op_checkpoints: shared checkpoint table for long-running ops
 -- ============================================================
 -- v0.36+ autonomous-remediation wave (migration v67). Pre-fix each op

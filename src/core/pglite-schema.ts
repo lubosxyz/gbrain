@@ -874,6 +874,17 @@ CREATE INDEX IF NOT EXISTS idx_mcp_log_time_agent ON mcp_request_log(created_at,
 CREATE INDEX IF NOT EXISTS idx_mcp_log_agent_time ON mcp_request_log(agent_name, created_at DESC);
 
 -- ============================================================
+-- mcp_request_log_purged: running per-token counters (KOM-277 retention)
+-- ============================================================
+-- See src/schema.sql for the canonical comment. Mirrored here because
+-- pglite-schema.ts is hand-maintained (DRIFT WARNING at the top of this file).
+CREATE TABLE IF NOT EXISTS mcp_request_log_purged (
+  token_name          TEXT PRIMARY KEY,
+  purged_requests     BIGINT NOT NULL DEFAULT 0,
+  purged_last_used_at TIMESTAMPTZ
+);
+
+-- ============================================================
 -- OAuth 2.1: clients, tokens, authorization codes
 -- ============================================================
 CREATE TABLE IF NOT EXISTS oauth_clients (
