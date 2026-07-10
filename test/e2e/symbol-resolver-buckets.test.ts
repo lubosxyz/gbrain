@@ -14,6 +14,7 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import {
   resolveSymbolEdgesIncremental,
   symbolEdgeCoverage,
+  symbolUnmatchedBuckets,
   UNMATCHED_REASONS,
 } from '../../src/core/chunkers/symbol-resolver.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
@@ -158,9 +159,10 @@ describe('unmatched reason buckets', () => {
     expect(stats.unmatched_buckets.no_candidate_anywhere).toBe(0);
   });
 
-  test('a user-defined symbol shadowing a builtin name is cross-file, not builtin', async () => {
-    // Precedence guard: cross_file is checked BEFORE builtin, so a project that
-    // defines its own `filter()` is never written off as stdlib.
+  test('a user symbol shadowing a builtin name is ambiguous, not a confident answer', async () => {
+    // `items.filter(…)` and a call to a project-defined `filter()` produce the
+    // same bare token. Calling it cross-file would over-claim; calling it a
+    // builtin would bury a real miss. Neither, then.
     await registerSource(engine, 's');
     const pageA = await insertCodePage(engine, 's', 'src/a.ts');
     const pageB = await insertCodePage(engine, 's', 'src/b.ts');
@@ -169,8 +171,24 @@ describe('unmatched reason buckets', () => {
     await insertEdge(engine, caller, 'caller', 'filter', 's');
 
     const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
-    expect(stats.unmatched_buckets.cross_file_same_source).toBe(1);
+    expect(stats.unmatched_buckets.ambiguous_bare_token).toBe(1);
+    expect(stats.unmatched_buckets.cross_file_same_source).toBe(0);
     expect(stats.unmatched_buckets.builtin_or_external).toBe(0);
+  });
+
+  test('a same-named declaration in ANOTHER language never explains the edge', async () => {
+    // The extractor emits no cross-language calls, so a Python `filter()` must
+    // not be offered as the reason a TypeScript edge missed.
+    await registerSource(engine, 's');
+    const pageA = await insertCodePage(engine, 's', 'src/a.ts');
+    const pageB = await insertCodePage(engine, 's', 'src/b.py');
+    const caller = await insertChunk(engine, pageA, 0, 'caller', 'typescript');
+    await insertChunkRaw(engine, pageB, 0, { language: 'python', qualified: 'helper', bare: 'helper' });
+    await insertEdge(engine, caller, 'caller', 'helper', 's');
+
+    const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect(stats.unmatched_buckets.cross_file_same_source).toBe(0);
+    expect(stats.unmatched_buckets.no_candidate_anywhere).toBe(1);
   });
 
 
@@ -204,10 +222,12 @@ describe('unmatched reason buckets', () => {
     expect(stats.unmatched_buckets.no_candidate_anywhere).toBe(1);
   });
 
-  test('a bare target matching a user symbol elsewhere beats the builtin list', async () => {
+  test('the bare-name arm sees a method stored under a qualified name', async () => {
     // The extractor emits bare `get`; the definition is stored qualified as
-    // `Widget.get`, so the exact-name probe misses. The bare-name arm catches it.
-    // Without that arm this project's own method reads as stdlib.
+    // `Widget.get`, so the exact-name probe misses and only the bare arm sees it.
+    // `get` is also a builtin, so the honest verdict is ambiguity — but the
+    // point is that the bare arm fired at all: without it this lands in
+    // `builtin_or_external` and the project's own method is written off.
     await registerSource(engine, 's');
     const pageA = await insertCodePage(engine, 's', 'src/a.ts');
     const pageB = await insertCodePage(engine, 's', 'src/b.ts');
@@ -216,8 +236,20 @@ describe('unmatched reason buckets', () => {
     await insertEdge(engine, caller, 'caller', 'get', 's');
 
     const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
-    expect(stats.unmatched_buckets.cross_file_same_source).toBe(1);
+    expect(stats.unmatched_buckets.ambiguous_bare_token).toBe(1);
     expect(stats.unmatched_buckets.builtin_or_external).toBe(0);
+  });
+
+  test('a non-builtin bare name elsewhere in the source IS cross-file', async () => {
+    await registerSource(engine, 's');
+    const pageA = await insertCodePage(engine, 's', 'src/a.ts');
+    const pageB = await insertCodePage(engine, 's', 'src/b.ts');
+    const caller = await insertChunk(engine, pageA, 0, 'caller', 'typescript');
+    await insertChunkRaw(engine, pageB, 0, { language: 'typescript', qualified: 'Mod.parseInput', bare: 'parseInput' });
+    await insertEdge(engine, caller, 'caller', 'parseInput', 's');
+
+    const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect(stats.unmatched_buckets.cross_file_same_source).toBe(1);
   });
 
   test('no_candidate_anywhere is the honest fallback', async () => {
@@ -282,6 +314,61 @@ describe('symbolEdgeCoverage', () => {
     const cov = await symbolEdgeCoverage(engine);
     expect(cov.pages_with_edges).toBe(0);
     expect(cov.page_coverage).toBe(0);
+  });
+});
+
+describe('symbolUnmatchedBuckets (committed state)', () => {
+  test('the diagnosis survives the walk that produced it', async () => {
+    await registerSource(engine, 's');
+    const page = await insertCodePage(engine, 's', 'src/a.ts');
+    const caller = await insertChunk(engine, page, 0, 'caller', 'typescript');
+    await insertEdge(engine, caller, 'caller', 'trim', 's');
+    await insertEdge(engine, caller, 'caller', 'someVendorHelper', 's');
+
+    const first = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect(first.unmatched_buckets.builtin_or_external).toBe(1);
+    expect(first.unmatched_buckets.no_candidate_anywhere).toBe(1);
+
+    // The second pass walks nothing — the watermark advanced. Walk-scoped stats
+    // go to zero; the persisted diagnosis must not.
+    const second = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect(second.chunks_walked).toBe(0);
+    expect(second.unmatched_buckets.builtin_or_external).toBe(0);
+
+    const committed = await symbolUnmatchedBuckets(engine, { sourceId: 's' });
+    expect(committed.builtin_or_external).toBe(1);
+    expect(committed.no_candidate_anywhere).toBe(1);
+  });
+
+  test('an edge that later resolves stops reporting why it once did not', async () => {
+    await registerSource(engine, 's');
+    const page = await insertCodePage(engine, 's', 'src/a.ts');
+    const caller = await insertChunk(engine, page, 0, 'caller', 'typescript');
+    await insertEdge(engine, caller, 'caller', 'parseInput', 's');
+
+    await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect((await symbolUnmatchedBuckets(engine, { sourceId: 's' })).no_candidate_anywhere).toBe(1);
+
+    // The definition arrives (a later sync indexes it) and the resolver re-walks.
+    await insertChunk(engine, page, 1, 'parseInput', 'typescript');
+    await engine.executeRaw(`UPDATE content_chunks SET edges_backfilled_at = NULL`, []);
+    const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect(stats.edges_resolved).toBe(1);
+
+    const committed = await symbolUnmatchedBuckets(engine, { sourceId: 's' });
+    expect(UNMATCHED_REASONS.reduce((n, r) => n + committed[r], 0)).toBe(0);
+  });
+
+  test('a soft-deleted page stops contributing its reasons', async () => {
+    await registerSource(engine, 's');
+    const page = await insertCodePage(engine, 's', 'src/a.ts');
+    const caller = await insertChunk(engine, page, 0, 'caller', 'typescript');
+    await insertEdge(engine, caller, 'caller', 'someVendorHelper', 's');
+    await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect((await symbolUnmatchedBuckets(engine, { sourceId: 's' })).no_candidate_anywhere).toBe(1);
+
+    await engine.executeRaw(`UPDATE pages SET deleted_at = NOW() WHERE id = $1`, [page]);
+    expect((await symbolUnmatchedBuckets(engine, { sourceId: 's' })).no_candidate_anywhere).toBe(0);
   });
 });
 

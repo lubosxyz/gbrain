@@ -1134,28 +1134,31 @@ async function runPhaseResolveSymbolEdges(
     };
   }
   try {
-    const { resolveSymbolEdgesIncremental, symbolEdgeCoverage, emptyUnmatchedBuckets, UNMATCHED_REASONS } =
-      await import('./chunkers/symbol-resolver.ts');
+    const {
+      resolveSymbolEdgesIncremental,
+      symbolEdgeCoverage,
+      symbolUnmatchedBuckets,
+      UNMATCHED_REASONS,
+    } = await import('./chunkers/symbol-resolver.ts');
     const { listSources } = await import('./sources-ops.ts');
     const sources = await listSources(engine);
     let totalChunks = 0;
     let totalResolved = 0;
     let totalAmbiguous = 0;
     let totalUnmatched = 0;
-    const buckets = emptyUnmatchedBuckets();
     for (const s of sources) {
       const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: s.id });
       totalChunks += stats.chunks_walked;
       totalResolved += stats.edges_resolved;
       totalAmbiguous += stats.edges_ambiguous;
       totalUnmatched += stats.edges_unmatched;
-      for (const reason of UNMATCHED_REASONS) buckets[reason] += stats.unmatched_buckets[reason];
     }
 
     // Brain-wide, not walk-scoped: a tick that walks zero pending chunks still
-    // reports the call graph's real page coverage. `edges_resolved` above only
-    // ever describes THIS tick.
+    // reports the call graph's real coverage and its real reason breakdown.
+    // `edges_resolved` / `totalUnmatched` above only ever describe THIS tick.
     const coverage = await symbolEdgeCoverage(engine);
+    const buckets = await symbolUnmatchedBuckets(engine);
 
     // Name the dominant reason in the summary — an unmatched count alone reads
     // as resolver failure when it's usually edges leaving the indexed corpus.
