@@ -144,8 +144,13 @@ describe('the code graph survives a metadata-blind re-embed', () => {
     // bucket names it. This is the signal that tells an operator to re-sync
     // rather than to go hunting for a resolver bug.
     await importCodeFile(engine, 'src/parser.ts', SRC, { noEmbed: true, sourceId: SOURCE });
+    // The blind writer nulled `language` too — reproduce the real shape, not a
+    // convenient one. An earlier version of this test kept `language` and so
+    // never noticed the classifier answering `unsupported_language`.
     await engine.executeRaw(
-      `UPDATE content_chunks SET symbol_name_qualified = NULL, symbol_name = NULL`,
+      `UPDATE content_chunks
+          SET symbol_name_qualified = NULL, symbol_name = NULL, symbol_type = NULL,
+              language = NULL, parent_symbol_path = NULL, doc_comment = NULL`,
       [],
     );
     await rewindWatermark();

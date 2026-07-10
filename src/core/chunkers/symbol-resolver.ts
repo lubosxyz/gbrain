@@ -87,13 +87,14 @@ export const BATCH_SIZE = 200;
  * "expected".
  */
 export type UnmatchedReason =
-  /** The calling chunk's language has no qualified-name convention, so nothing
-   *  in it can ever enter the candidate index. Fix = teach qualified-names.ts. */
+  /** The calling chunk names a language that has no qualified-name convention,
+   *  so nothing in it can ever enter the candidate index. Fix = teach
+   *  qualified-names.ts. */
   | 'unsupported_language'
-  /** The calling chunk's PAGE has zero chunks carrying `symbol_name_qualified`.
-   *  The index for that page is empty, so no match was ever possible. Fix =
-   *  re-chunk the file (`gbrain sync --force`); historically this was a
-   *  metadata wipe, see chunk-metadata-sql.ts. */
+  /** The calling chunk has no `language` at all, or its PAGE has zero chunks
+   *  carrying `symbol_name_qualified`. Either way the index for that page is
+   *  empty and no match was ever possible. Fix = re-chunk the file;
+   *  historically this was a metadata wipe, see chunk-metadata-sql.ts. */
   | 'missing_symbol_metadata'
   /** Same page holds a chunk whose qualified name ENDS in the target token
    *  (index has `Class.render`, the edge points at bare `render`). Fix =
@@ -351,7 +352,13 @@ async function processChunkBatch(
     stats.edges_unmatched += 1;
     const language = chunkById.get(e.from_chunk_id)?.language ?? null;
 
-    if (!supportsQualifiedNames(language)) {
+    if (language === null) {
+      // A code chunk with no language never carried metadata, or had it wiped.
+      // Do NOT read this as "unsupported language": that would send an operator
+      // to teach qualified-names.ts a language it already knows, when the real
+      // remedy is a re-chunk. The wiping writer nulled `language` too.
+      stats.unmatched_buckets.missing_symbol_metadata += 1;
+    } else if (!supportsQualifiedNames(language)) {
       stats.unmatched_buckets.unsupported_language += 1;
     } else if ((qualCountByPage.get(pageId) ?? 0) === 0) {
       stats.unmatched_buckets.missing_symbol_metadata += 1;
@@ -363,7 +370,9 @@ async function processChunkBatch(
   }
 
   // One batched probe settles cross_file_same_source for every leftover edge:
-  // does ANY page in this source declare that exact qualified name? A hit means
+  // does any LIVE page in this source declare that exact qualified name? Pages
+  // inside the soft-delete window still hold their chunks, and a definition no
+  // normal read can reach is not "the definition exists, just elsewhere". A hit means
   // the definition is real and only the same-file scope kept us from it — a
   // resolver limitation, not a missing symbol. A miss falls through to the
   // builtin classifier, then to the honest unknown bucket.
@@ -374,6 +383,7 @@ async function processChunkBatch(
          FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
         WHERE p.source_id = $1
+          AND p.deleted_at IS NULL
           AND cc.symbol_name_qualified = ANY($2::text[])`,
       [sourceId, targets],
     );

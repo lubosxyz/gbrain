@@ -107,6 +107,43 @@ describe('code metadata survives metadata-blind chunk upserts', () => {
     expect(chunk!.language).toBe('typescript');
   });
 
+  test('a prose chunk landing on a fenced_code index does NOT inherit its metadata', async () => {
+    // Markdown pages interleave `chunk_source='fenced_code'` chunks (which DO
+    // carry language/symbol, extracted through the code chunker) with
+    // metadata-free `compiled_truth` prose. Dropping a fence shifts a prose
+    // chunk onto the index the fence used to hold. Without the chunk_source
+    // clause in METADATA_BLIND_WRITER, that prose row would inherit the fence's
+    // language forever and `code-def` would answer with prose.
+    await engine.putPage('notes/snippet', {
+      type: 'note',
+      title: 'Snippet',
+      compiled_truth: 'prose',
+      timeline: '',
+    });
+    await engine.upsertChunks('notes/snippet', [{
+      chunk_index: 0,
+      chunk_text: 'def parse(x):\n    return x.strip()',
+      chunk_source: 'fenced_code',
+      language: 'python',
+      symbol_name: 'parse',
+      symbol_type: 'function',
+      symbol_name_qualified: 'parse',
+    }]);
+
+    // The fence is deleted; a prose chunk takes index 0.
+    await engine.upsertChunks('notes/snippet', [{
+      chunk_index: 0,
+      chunk_text: 'Just prose now, the code block is gone.',
+      chunk_source: 'compiled_truth',
+    }]);
+
+    const [chunk] = await engine.getChunks('notes/snippet');
+    expect(chunk!.chunk_source).toBe('compiled_truth');
+    expect(chunk!.language).toBeNull();
+    expect(chunk!.symbol_name_qualified).toBeNull();
+    expect(chunk!.symbol_name).toBeNull();
+  });
+
   test('the chunker CAN still retract a symbol (supplies partial metadata)', async () => {
     // A real re-chunk that turns a symbol chunk into a plain-text chunk sets
     // `language` (code chunker always stamps it) but no symbol. That writer is

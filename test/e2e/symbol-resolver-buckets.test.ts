@@ -63,7 +63,7 @@ describe('unmatched reason buckets', () => {
     expect(stats.unmatched_buckets.no_candidate_anywhere).toBe(0);
   });
 
-  test('unsupported_language outranks missing metadata — it is the root cause', async () => {
+  test('a NAMED but unsupported language is unsupported_language', async () => {
     await registerSource(engine, 's');
     const page = await insertCodePage(engine, 's', 'src/a.erl');
     const caller = await insertChunkRaw(engine, page, 0, { language: 'erlang', qualified: null });
@@ -72,6 +72,37 @@ describe('unmatched reason buckets', () => {
     const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
     expect(stats.unmatched_buckets.unsupported_language).toBe(1);
     expect(stats.unmatched_buckets.missing_symbol_metadata).toBe(0);
+  });
+
+  test('a NULL language is missing metadata, never "unsupported language"', async () => {
+    // The exact shape a metadata wipe leaves behind: the blind writer nulled
+    // `language` along with the symbol columns. Reporting `unsupported_language`
+    // here would send an operator to teach qualified-names.ts a language it
+    // already supports, instead of re-chunking.
+    await registerSource(engine, 's');
+    const page = await insertCodePage(engine, 's', 'src/a.ts');
+    const caller = await insertChunkRaw(engine, page, 0, { language: null, qualified: null });
+    await insertEdge(engine, caller, 'caller', 'parseInput', 's');
+
+    const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect(stats.unmatched_buckets.missing_symbol_metadata).toBe(1);
+    expect(stats.unmatched_buckets.unsupported_language).toBe(0);
+  });
+
+  test('a definition on a soft-deleted page is not cross_file_same_source', async () => {
+    // Soft-deleted pages keep their chunks until purge. A definition no normal
+    // read can reach is not "it exists, just in another file".
+    await registerSource(engine, 's');
+    const pageA = await insertCodePage(engine, 's', 'src/a.ts');
+    const pageB = await insertCodePage(engine, 's', 'src/b.ts');
+    const caller = await insertChunk(engine, pageA, 0, 'caller', 'typescript');
+    await insertChunk(engine, pageB, 0, 'parseInput', 'typescript');
+    await engine.executeRaw(`UPDATE pages SET deleted_at = NOW() WHERE id = $1`, [pageB]);
+    await insertEdge(engine, caller, 'caller', 'parseInput', 's');
+
+    const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect(stats.unmatched_buckets.cross_file_same_source).toBe(0);
+    expect(stats.unmatched_buckets.no_candidate_anywhere).toBe(1);
   });
 
   test('bare_token_vs_qualified: the file declares Class.render, the edge says render', async () => {

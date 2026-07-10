@@ -22,11 +22,19 @@
  * probes the `edges_backfilled_at` watermark, never whether a match was
  * possible.
  *
- * Rule: a writer that supplies NONE of the eight columns is not the chunker,
- * so the existing values survive. A writer that supplies ANY of them is
- * authoritative for ALL of them — that's how a real re-chunk retracts a
- * symbol (the code chunker always stamps `language`, even on the plain-text
- * chunks between symbols, so "supplies nothing" can never be a chunker).
+ * Rule: a writer is metadata-blind when it supplies NONE of the eight columns
+ * AND leaves `chunk_source` as it found it. Then the existing values survive.
+ * Any other writer is authoritative for ALL eight — that's how a real re-chunk
+ * retracts a symbol.
+ *
+ * The `chunk_source` clause is what makes "supplies nothing" safe to read as
+ * "isn't the chunker". Markdown pages carry `chunk_source='fenced_code'` chunks
+ * that DO have `language`/`symbol_name` (import-file.ts extracts fenced blocks
+ * through the code chunker), interleaved with metadata-free
+ * `chunk_source='compiled_truth'` prose. Editing a page can drop a fence and
+ * shift a prose chunk onto the index a fenced_code chunk used to hold; without
+ * this clause the prose row would inherit that fence's language and symbol
+ * forever, and `code-def` would answer with prose.
  *
  * Deliberately NOT predicated on `chunk_text` changing: `reindex --contextual`
  * rewrites the text while supplying no code metadata, and that must not read
@@ -36,7 +44,8 @@
  * into both engines from here so postgres and pglite cannot drift.
  */
 export const METADATA_BLIND_WRITER = `(
-  EXCLUDED.language IS NULL
+  EXCLUDED.chunk_source IS NOT DISTINCT FROM content_chunks.chunk_source
+  AND EXCLUDED.language IS NULL
   AND EXCLUDED.symbol_name IS NULL
   AND EXCLUDED.symbol_type IS NULL
   AND EXCLUDED.start_line IS NULL
