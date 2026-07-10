@@ -210,6 +210,18 @@ function qualifiedLeaf(qualified: string): string {
 }
 
 /**
+ * The edge extractor emits no cross-LANGUAGE calls, but TS/JS variants call
+ * across each other freely: a `.ts` caller reaches a symbol in a `.tsx` or `.js`
+ * file. Collapse those to one family so the cross-file probe scopes to
+ * "compatible languages", not "byte-identical language string". Anything else
+ * (python, rust, …) is its own family.
+ */
+const TS_JS_FAMILY = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
+function languageFamily(language: string): string {
+  return TS_JS_FAMILY.has(language) ? 'ts-js' : language;
+}
+
+/**
  * Resolve unresolved edges for chunks whose `edges_backfilled_at` is
  * stale or null. Returns stats; updates DB in BATCH_SIZE-chunk transactions.
  */
@@ -412,8 +424,14 @@ async function processChunkBatch(
     // Language scoping matters: the extractor never emits a cross-language call,
     // so an unrelated Python `filter()` must not explain a TypeScript edge.
     const targets = Array.from(new Set(needsCrossFileProbe.map((p) => p.target)));
-    const languages = Array.from(
-      new Set(needsCrossFileProbe.map((p) => p.language).filter((l): l is string => l !== null)),
+    // Expand caller languages to their families so the SQL filter admits every
+    // compatible variant (a `.ts` caller must see `.tsx`/`.js` declarations),
+    // then match per-edge on the family key below.
+    const callerLangs = needsCrossFileProbe
+      .map((p) => p.language)
+      .filter((l): l is string => l !== null);
+    const probeLangs = Array.from(
+      new Set(callerLangs.flatMap((l) => (languageFamily(l) === 'ts-js' ? Array.from(TS_JS_FAMILY) : [l]))),
     );
     const rows = await engine.executeRaw<{
       language: string;
@@ -427,21 +445,22 @@ async function processChunkBatch(
           AND p.deleted_at IS NULL
           AND cc.language = ANY($3::text[])
           AND (cc.symbol_name_qualified = ANY($2::text[]) OR cc.symbol_name = ANY($2::text[]))`,
-      [sourceId, targets, languages],
+      [sourceId, targets, probeLangs],
     );
 
-    /** "<language>\u0000<name>" for every exact qualified name declared in the source. */
-    const exactByLanguage = new Set<string>();
+    /** "<family>\u0000<name>" for every exact qualified name declared in the source. */
+    const exactByFamily = new Set<string>();
     /** Same, for bare `symbol_name` declarations. */
-    const bareByLanguage = new Set<string>();
+    const bareByFamily = new Set<string>();
     for (const r of rows) {
-      if (r.symbol_name_qualified) exactByLanguage.add(`${r.language}\u0000${r.symbol_name_qualified}`);
-      if (r.symbol_name) bareByLanguage.add(`${r.language}\u0000${r.symbol_name}`);
+      const fam = languageFamily(r.language);
+      if (r.symbol_name_qualified) exactByFamily.add(`${fam}\u0000${r.symbol_name_qualified}`);
+      if (r.symbol_name) bareByFamily.add(`${fam}\u0000${r.symbol_name}`);
     }
 
     for (const { edgeId, target, language } of needsCrossFileProbe) {
-      const key = `${language}\u0000${target}`;
-      const declared = exactByLanguage.has(key) || bareByLanguage.has(key);
+      const key = `${languageFamily(language!)}\u0000${target}`;
+      const declared = exactByFamily.has(key) || bareByFamily.has(key);
       const builtin = isLanguageBuiltin(target, language);
 
       if (declared && builtin) {
@@ -492,7 +511,8 @@ async function processChunkBatch(
   for (const [reason, edgeIds] of unmatchedByReason) {
     await engine.executeRaw(
       `UPDATE code_edges_symbol
-          SET edge_metadata = COALESCE(edge_metadata, '{}'::jsonb)
+          SET edge_metadata = (COALESCE(edge_metadata, '{}'::jsonb)
+                                 - 'resolved_chunk_id' - 'ambiguous' - 'candidates')
                            || jsonb_build_object('unmatched_reason', $1::text)
         WHERE id = ANY($2::int[])`,
       [reason, edgeIds],

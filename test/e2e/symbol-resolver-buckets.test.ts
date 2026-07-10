@@ -176,6 +176,21 @@ describe('unmatched reason buckets', () => {
     expect(stats.unmatched_buckets.builtin_or_external).toBe(0);
   });
 
+  test('a .ts caller resolves a definition in a .tsx file (same family)', async () => {
+    // The extractor emits no cross-language calls, but TS/JS variants call each
+    // other freely. A byte-exact language filter would strand this.
+    await registerSource(engine, 's');
+    const pageA = await insertCodePage(engine, 's', 'src/a.ts');
+    const pageB = await insertCodePage(engine, 's', 'src/b.tsx');
+    const caller = await insertChunk(engine, pageA, 0, 'caller', 'typescript');
+    await insertChunkRaw(engine, pageB, 0, { language: 'tsx', qualified: 'Widget.parseInput', bare: 'parseInput' });
+    await insertEdge(engine, caller, 'caller', 'parseInput', 's');
+
+    const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect(stats.unmatched_buckets.cross_file_same_source).toBe(1);
+    expect(stats.unmatched_buckets.no_candidate_anywhere).toBe(0);
+  });
+
   test('a same-named declaration in ANOTHER language never explains the edge', async () => {
     // The extractor emits no cross-language calls, so a Python `filter()` must
     // not be offered as the reason a TypeScript edge missed.
@@ -357,6 +372,43 @@ describe('symbolUnmatchedBuckets (committed state)', () => {
 
     const committed = await symbolUnmatchedBuckets(engine, { sourceId: 's' });
     expect(UNMATCHED_REASONS.reduce((n, r) => n + committed[r], 0)).toBe(0);
+  });
+
+  test('an edge wiped after it resolved ends up ONLY unmatched, never both', async () => {
+    // Reproduces the wipe timeline: the edge resolved once (carries
+    // resolved_chunk_id), the page's metadata was then nulled, and the version
+    // bump forces a re-walk. It must not be counted as both resolved AND
+    // unmatched.
+    await registerSource(engine, 's');
+    const page = await insertCodePage(engine, 's', 'src/a.ts');
+    const caller = await insertChunk(engine, page, 0, 'caller', 'typescript');
+    const def = await insertChunk(engine, page, 1, 'parseInput', 'typescript');
+    await insertEdge(engine, caller, 'caller', 'parseInput', 's');
+
+    await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+    expect((await symbolEdgeCoverage(engine, { sourceId: 's' })).pages_with_resolved_edges).toBe(1);
+
+    // Wipe the definition's qualified name (the metadata-blind writer's damage)
+    // and force a re-walk.
+    await engine.executeRaw(
+      `UPDATE content_chunks SET symbol_name_qualified = NULL, symbol_name = NULL WHERE id = $1`,
+      [def],
+    );
+    await engine.executeRaw(`UPDATE content_chunks SET edges_backfilled_at = NULL`, []);
+    await resolveSymbolEdgesIncremental(engine, { sourceId: 's' });
+
+    // Exactly one of the two states, never both.
+    const cov = await symbolEdgeCoverage(engine, { sourceId: 's' });
+    const buckets = await symbolUnmatchedBuckets(engine, { sourceId: 's' });
+    expect(cov.pages_with_resolved_edges).toBe(0);
+    expect(UNMATCHED_REASONS.reduce((n, r) => n + buckets[r], 0)).toBe(1);
+
+    const both = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM code_edges_symbol
+        WHERE edge_metadata ? 'resolved_chunk_id' AND edge_metadata ? 'unmatched_reason'`,
+      [],
+    );
+    expect(Number(both[0]!.n)).toBe(0);
   });
 
   test('a soft-deleted page stops contributing its reasons', async () => {
