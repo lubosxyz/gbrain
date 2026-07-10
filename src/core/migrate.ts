@@ -5505,6 +5505,42 @@ export const MIGRATIONS: Migration[] = [
         WHERE dimension IS NOT NULL;
     `,
   },
+  {
+    version: 123,
+    name: 'mcp_request_log_purged_counters',
+    // KOM-277: mcp_request_log retention. A representative brain (gbrain_komfi)
+    // carries 246k rows / 88MB, growing ~57MB/month, with NO foreign key in or
+    // out — a pure append-only usage log, safe to prune on a TTL. But
+    // serve-http's admin `/admin/api/agents` endpoint computes `total_requests`
+    // (COUNT(*)) and `last_used_at` (max(created_at)) LIVE over mcp_request_log
+    // per token_name — deleting old rows would silently zero those metrics for
+    // any token whose history got purged. This table carries the running
+    // counters (purged_requests, purged_last_used_at) that the retention purge
+    // (src/core/mcp-request-log-retention.ts, wired into the cycle purge phase)
+    // adds to on every batch, so serve-http can add them back into the live
+    // aggregate. No FK to any token table (oauth_clients/access_tokens) in
+    // either direction — mcp_request_log itself carries none either (a token
+    // can be revoked/deleted while its historical log rows and purged counters
+    // live on as an audit trail), so this table keeps the same posture as its
+    // source table.
+    //
+    // Additive + idempotent (CREATE TABLE IF NOT EXISTS). No RLS ALTER needed
+    // here: the v35 auto_rls_event_trigger (already installed on any brain
+    // that has migrated past v35, which this one has by definition) fires on
+    // this CREATE TABLE and enables RLS automatically; a genuinely fresh
+    // install creates this table via schema.sql before any migration runs,
+    // and v35's own one-time backfill sweeps it up in that same initSchema()
+    // pass. Mirrored in src/schema.sql, src/core/pglite-schema.ts, and the
+    // generated src/core/schema-embedded.ts for fresh installs.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS mcp_request_log_purged (
+        token_name          TEXT PRIMARY KEY,
+        purged_requests     BIGINT NOT NULL DEFAULT 0,
+        purged_last_used_at TIMESTAMPTZ
+      );
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
