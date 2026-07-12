@@ -32,58 +32,27 @@ export interface OrphanResult {
   excluded: number;
 }
 
-// --- Filter constants ---
-
-/** Slug suffixes that are always auto-generated root files */
-const AUTO_SUFFIX_PATTERNS = ['/_index', '/log'];
-
-/** Page slugs that are pseudo-pages by convention */
-const PSEUDO_SLUGS = new Set(['_atlas', '_index', '_stats', '_orphans', '_scratch', 'claude']);
-
-/** Slug segment that marks raw sources */
-const RAW_SEGMENT = '/raw/';
-
-/** Slug prefixes where no inbound links is expected */
-const DENY_PREFIXES = [
-  'output/',
-  'dashboards/',
-  'scripts/',
-  'templates/',
-  'openclaw/config/',
-];
-
-/** First slug segments where no inbound links is expected */
-const FIRST_SEGMENT_EXCLUSIONS = new Set(['scratch', 'thoughts', 'catalog', 'entities']);
-
-// --- Filter logic ---
-
-/**
- * Returns true if a slug should be excluded from orphan reporting by default.
- * These are pages where having no inbound links is expected / not a content problem.
- */
-export function shouldExclude(slug: string): boolean {
-  // Pseudo-pages (exact match)
-  if (PSEUDO_SLUGS.has(slug)) return true;
-
-  // Auto-generated suffix patterns
-  for (const suffix of AUTO_SUFFIX_PATTERNS) {
-    if (slug.endsWith(suffix)) return true;
-  }
-
-  // Raw source slugs
-  if (slug.includes(RAW_SEGMENT)) return true;
-
-  // Deny-prefix slugs
-  for (const prefix of DENY_PREFIXES) {
-    if (slug.startsWith(prefix)) return true;
-  }
-
-  // First-segment exclusions
-  const firstSegment = slug.split('/')[0];
-  if (FIRST_SEGMENT_EXCLUSIONS.has(firstSegment)) return true;
-
-  return false;
-}
+// --- Filter constants + logic ---
+// Moved to core/slug-exclusions.ts (a leaf module) so the health metric can
+// share the exact taxonomy without an engine → coverage → commands/orphans →
+// engine import cycle. Imported for local use and re-exported to keep this
+// module's public API.
+import {
+  AUTO_SUFFIX_PATTERNS,
+  PSEUDO_SLUGS,
+  RAW_SEGMENT,
+  DENY_PREFIXES,
+  FIRST_SEGMENT_EXCLUSIONS,
+  shouldExclude,
+} from '../core/slug-exclusions.ts';
+export {
+  AUTO_SUFFIX_PATTERNS,
+  PSEUDO_SLUGS,
+  RAW_SEGMENT,
+  DENY_PREFIXES,
+  FIRST_SEGMENT_EXCLUSIONS,
+  shouldExclude,
+};
 
 /**
  * Derive domain from frontmatter or first slug segment.

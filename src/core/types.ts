@@ -1457,6 +1457,36 @@ export interface BrainHealth {
   /** Top 5 entities by total link count (in + out). */
   most_connected: Array<{ slug: string; link_count: number }>;
   /**
+   * Page counts split by surface. `orphan_pages` above is a whole-`pages` count,
+   * so on a brain with a code source it is dominated by code-chunk pages that
+   * are wired through `code_edges_symbol`, never through `links` — the split
+   * makes that visible instead of letting one number lie about both graphs.
+   */
+  pages_by_surface?: {
+    prose: number;
+    code: number;
+    image: number;
+    raw_capture: number;
+  };
+  /**
+   * Fraction of eligible knowledge pages carrying >= 1 human-meant edge. The
+   * metric orphan rate was reached for and could never be: a fixed denominator
+   * (real knowledge pages, not code chunks) over a tightened numerator (links a
+   * human authored, not auto-linked mentions).
+   *
+   * See core/trusted-graph-coverage.ts for the eligibility and trust rules.
+   *
+   * Optional like `migrations` below, and for the same reason: BrainHealth is
+   * an MCP wire type, so a new thin client talking to an older server must not
+   * be type-lied to about fields that server never sends. Both engines always
+   * populate it.
+   */
+  trusted_graph_coverage?: number;
+  /** Denominator of `trusted_graph_coverage`. */
+  trusted_graph_eligible_pages?: number;
+  /** Numerator of `trusted_graph_coverage`. */
+  trusted_graph_covered_pages?: number;
+  /**
    * Per-component contribution to brain_score. Sum equals brain_score by
    * construction. Displayed by `gbrain doctor` when brain_score < 100.
    * Field names are distinct from the entity-scoped link_coverage /

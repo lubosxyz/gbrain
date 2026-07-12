@@ -375,6 +375,13 @@ export interface CycleReport {
     edges_resolved: number;
     /** v0.34: number of code edges marked ambiguous (2+ candidates) by the resolve_symbol_edges phase. */
     edges_ambiguous: number;
+    /**
+     * Number of code edges the resolve_symbol_edges phase could not match to a
+     * same-file definition. Not a failure count on its own — most unmatched
+     * edges point out of the indexed corpus (builtins, third-party deps). The
+     * per-reason split lives in the phase's `details.unmatched_buckets`.
+     */
+    edges_unmatched: number;
     /** v0.26.5: number of source rows hard-deleted by the purge phase. */
     purged_sources_count: number;
     /** v0.26.5: number of page rows hard-deleted by the purge phase. */
@@ -1127,7 +1134,12 @@ async function runPhaseResolveSymbolEdges(
     };
   }
   try {
-    const { resolveSymbolEdgesIncremental } = await import('./chunkers/symbol-resolver.ts');
+    const {
+      resolveSymbolEdgesIncremental,
+      symbolEdgeCoverage,
+      symbolUnmatchedBuckets,
+      UNMATCHED_REASONS,
+    } = await import('./chunkers/symbol-resolver.ts');
     const { listSources } = await import('./sources-ops.ts');
     const sources = await listSources(engine);
     let totalChunks = 0;
@@ -1141,19 +1153,49 @@ async function runPhaseResolveSymbolEdges(
       totalAmbiguous += stats.edges_ambiguous;
       totalUnmatched += stats.edges_unmatched;
     }
+
+    // Brain-wide, not walk-scoped: a tick that walks zero pending chunks still
+    // reports the call graph's real coverage and its real reason breakdown.
+    // `edges_resolved` / `totalUnmatched` above only ever describe THIS tick.
+    const coverage = await symbolEdgeCoverage(engine);
+    const buckets = await symbolUnmatchedBuckets(engine);
+
+    // The walk line is THIS tick's work; the graph line is brain-wide committed
+    // state. Keep them apart — a tick that walks 3 chunks must not read
+    // "unmatched 3 (mostly builtin: 10000)", mixing a tick count with a
+    // brain-wide one. The dominant reason belongs to the brain-wide total.
+    const brainUnmatched = UNMATCHED_REASONS.reduce((n, r) => n + buckets[r], 0);
+    const topReason = UNMATCHED_REASONS
+      .map((reason) => ({ reason, count: buckets[reason] }))
+      .filter((b) => b.count > 0)
+      .sort((a, b) => b.count - a.count)[0];
+
+    const walkSummary =
+      totalChunks === 0
+        ? 'no chunks needed symbol resolution'
+        : `${totalChunks} chunk(s) walked; resolved ${totalResolved}, ambiguous ${totalAmbiguous}, unmatched ${totalUnmatched}`;
+
+    const graphSummary =
+      `graph: page coverage ${coverage.pages_with_resolved_edges}/${coverage.pages_with_edges}` +
+      ` (${(coverage.page_coverage * 100).toFixed(1)}%)` +
+      (brainUnmatched > 0
+        ? `; ${brainUnmatched} unmatched edge(s)` + (topReason ? ` (mostly ${topReason.reason}: ${topReason.count})` : '')
+        : '');
+
     return {
       phase: 'resolve_symbol_edges',
       status: 'ok',
       duration_ms: 0,
-      summary:
-        totalChunks === 0
-          ? 'no chunks needed symbol resolution'
-          : `${totalChunks} chunk(s) walked; resolved ${totalResolved}, ambiguous ${totalAmbiguous}, unmatched ${totalUnmatched}`,
+      summary: `${walkSummary}; ${graphSummary}`,
       details: {
         chunks_walked: totalChunks,
         edges_resolved: totalResolved,
         edges_ambiguous: totalAmbiguous,
         edges_unmatched: totalUnmatched,
+        unmatched_buckets: buckets,
+        pages_with_resolved_edges: coverage.pages_with_resolved_edges,
+        pages_with_edges: coverage.pages_with_edges,
+        page_coverage: coverage.page_coverage,
         sources_walked: sources.length,
       },
     };
@@ -2386,6 +2428,7 @@ function emptyTotals(): CycleReport['totals'] {
     pages_emotional_weight_recomputed: 0,
     edges_resolved: 0,
     edges_ambiguous: 0,
+    edges_unmatched: 0,
     purged_sources_count: 0,
     purged_pages_count: 0,
     facts_consolidated: 0,
@@ -2425,6 +2468,7 @@ function extractTotals(phases: PhaseResult[]): CycleReport['totals'] {
     } else if (p.phase === 'resolve_symbol_edges' && p.details) {
       t.edges_resolved = Number(p.details.edges_resolved ?? 0);
       t.edges_ambiguous = Number(p.details.edges_ambiguous ?? 0);
+      t.edges_unmatched = Number(p.details.edges_unmatched ?? 0);
     } else if (p.phase === 'purge' && p.details) {
       t.purged_sources_count = Number(p.details.purged_sources_count ?? 0);
       t.purged_pages_count = Number(p.details.purged_pages_count ?? 0);

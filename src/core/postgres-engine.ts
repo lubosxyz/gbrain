@@ -56,6 +56,8 @@ import type {
   EnrichCandidatesOpts, EnrichCandidate,
 } from './types.ts';
 import { GBrainError, PAGE_SORT_SQL, ENRICH_ORDER_SQL } from './types.ts';
+import { METADATA_BLIND_WRITER } from './chunk-metadata-sql.ts';
+import { computePagesBySurface, computeTrustedGraphCoverage } from './trusted-graph-coverage.ts';
 import { finalizeLastSeen } from './chronicle/last-seen.ts';
 import { computeAnomaliesFromBuckets } from './cycle/anomaly.ts';
 import * as db from './db.ts';
@@ -2235,14 +2237,14 @@ export class PostgresEngine implements BrainEngine {
                 THEN EXCLUDED.embedded_at
            ELSE content_chunks.embedded_at
          END,
-         language = EXCLUDED.language,
-         symbol_name = EXCLUDED.symbol_name,
-         symbol_type = EXCLUDED.symbol_type,
-         start_line = EXCLUDED.start_line,
-         end_line = EXCLUDED.end_line,
-         parent_symbol_path = EXCLUDED.parent_symbol_path,
-         doc_comment = EXCLUDED.doc_comment,
-         symbol_name_qualified = EXCLUDED.symbol_name_qualified,
+         language = CASE WHEN ${METADATA_BLIND_WRITER} THEN content_chunks.language ELSE EXCLUDED.language END,
+         symbol_name = CASE WHEN ${METADATA_BLIND_WRITER} THEN content_chunks.symbol_name ELSE EXCLUDED.symbol_name END,
+         symbol_type = CASE WHEN ${METADATA_BLIND_WRITER} THEN content_chunks.symbol_type ELSE EXCLUDED.symbol_type END,
+         start_line = CASE WHEN ${METADATA_BLIND_WRITER} THEN content_chunks.start_line ELSE EXCLUDED.start_line END,
+         end_line = CASE WHEN ${METADATA_BLIND_WRITER} THEN content_chunks.end_line ELSE EXCLUDED.end_line END,
+         parent_symbol_path = CASE WHEN ${METADATA_BLIND_WRITER} THEN content_chunks.parent_symbol_path ELSE EXCLUDED.parent_symbol_path END,
+         doc_comment = CASE WHEN ${METADATA_BLIND_WRITER} THEN content_chunks.doc_comment ELSE EXCLUDED.doc_comment END,
+         symbol_name_qualified = CASE WHEN ${METADATA_BLIND_WRITER} THEN content_chunks.symbol_name_qualified ELSE EXCLUDED.symbol_name_qualified END,
          modality = EXCLUDED.modality,
          embedding_image = COALESCE(EXCLUDED.embedding_image, content_chunks.embedding_image)`,
       params as Parameters<typeof sql.unsafe>[1],
@@ -5077,6 +5079,14 @@ export class PostgresEngine implements BrainEngine {
     const noDeadLinksScore = pageCount === 0 ? 10 : Math.round(noDeadLinks * 10);
     const brainScore = embedCoverageScore + linkDensityScore + timelineCoverageScore + noOrphansScore + noDeadLinksScore;
 
+    // Surface split + trusted-graph coverage live outside the big health CTE:
+    // they reuse the orphans slug taxonomy (TS, not SQL) so "what is a real
+    // knowledge page" is defined exactly once. brain_score deliberately does
+    // NOT consume them — rebalancing the 35/25/15/15/10 weights is a separate,
+    // breaking decision.
+    const surface = await computePagesBySurface(this);
+    const trusted = await computeTrustedGraphCoverage(this);
+
     return {
       page_count: pageCount,
       embed_coverage: embedCoverage,
@@ -5091,6 +5101,10 @@ export class PostgresEngine implements BrainEngine {
         slug: c.slug,
         link_count: Number(c.link_count),
       })),
+      pages_by_surface: surface,
+      trusted_graph_coverage: trusted.coverage,
+      trusted_graph_eligible_pages: trusted.eligible_pages,
+      trusted_graph_covered_pages: trusted.covered_pages,
       embed_coverage_score: embedCoverageScore,
       link_density_score: linkDensityScore,
       timeline_coverage_score: timelineCoverageScore,

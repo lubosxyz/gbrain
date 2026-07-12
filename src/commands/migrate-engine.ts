@@ -180,6 +180,11 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
     // Copy chunks with embeddings.
     const chunks = await sourceEngine.getChunksWithEmbeddings(page.slug, sourceOpts);
     if (chunks.length > 0) {
+      // Carry the chunker's tree-sitter columns across. Dropping them here
+      // silently decapitated the code graph on every engine migration: the
+      // symbol resolver builds its candidate index solely from
+      // `symbol_name_qualified`, so the migrated brain resolved 0% of its call
+      // graph while reporting a healthy `code-graph-readiness`.
       await targetEngine.upsertChunks(page.slug, chunks.map(c => ({
         chunk_index: c.chunk_index,
         chunk_text: c.chunk_text,
@@ -187,6 +192,14 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
         embedding: c.embedding || undefined,
         model: c.model,
         token_count: c.token_count || undefined,
+        language: c.language || undefined,
+        symbol_name: c.symbol_name || undefined,
+        symbol_type: c.symbol_type || undefined,
+        start_line: c.start_line ?? undefined,
+        end_line: c.end_line ?? undefined,
+        parent_symbol_path: c.parent_symbol_path || undefined,
+        doc_comment: c.doc_comment || undefined,
+        symbol_name_qualified: c.symbol_name_qualified || undefined,
       })), sourceOpts);
     }
 

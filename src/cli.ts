@@ -910,6 +910,21 @@ export function formatResult(opName: string, result: unknown): string {
         `Stale pages: ${h.stale_pages}`,
         `Orphan pages: ${h.orphan_pages}`,
       ];
+      // Print the surface split directly under `Orphan pages`, where it does the
+      // most good: on a brain with a code source that count is ~all code chunks,
+      // which cannot carry wikilinks and are not a content problem.
+      if (h.pages_by_surface) {
+        const s = h.pages_by_surface;
+        lines.push(
+          `Pages by surface: ${s.prose} prose, ${s.code} code, ${s.image} image, ${s.raw_capture} raw capture`,
+        );
+      }
+      if (h.trusted_graph_coverage !== undefined) {
+        lines.push(
+          `Trusted graph coverage: ${(h.trusted_graph_coverage * 100).toFixed(1)}%` +
+            ` (${h.trusted_graph_covered_pages}/${h.trusted_graph_eligible_pages} knowledge pages)`,
+        );
+      }
       if (h.link_coverage !== undefined) {
         lines.push(`Link coverage (entities): ${(h.link_coverage * 100).toFixed(1)}%`);
       }
